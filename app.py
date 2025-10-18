@@ -180,15 +180,14 @@ def ensure_dataset_loaded() -> None:
         app.logger.warning("Initial data update failed: %s", exc)
 
 
-@app.before_first_request
+@app.before_request
 def _start_background_updater() -> None:
+    """Ensure the background updater thread is started once per process."""
     global background_started
     with data_lock:
-        already_started = background_started
-        if not background_started:
-            background_started = True
-    if already_started:
-        return
+        if background_started:
+            return
+        background_started = True
 
     def _runner() -> None:
         while True:
