@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 from flask import Flask, jsonify, render_template_string, request
 
-APP_UPDATE_INTERVAL = 5  # seconds
+APP_UPDATE_INTERVAL = 60  # seconds
 DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
 DEFAULT_LOOKBACK = timedelta(days=7)
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
@@ -378,7 +378,7 @@ def index():
           }
 
           fetchAndRender();
-          setInterval(fetchAndRender, 5000);
+          setInterval(fetchAndRender, 60000);
         </script>
       </body>
     </html>
