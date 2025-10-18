@@ -33,9 +33,16 @@ Place the aggregated minute-level file at `data/btc_usdt_1m_all.parquet`. If you
 The Flask application automatically keeps the dataset current and exposes a real-time dashboard:
 
 ```bash
-export FLASK_APP=app.py
-flask run --debug
+flask --app app.py --debug run
 ```
+
+The explicit `--app` flag works the same way on macOS, Linux, and Windows so you
+do not need to worry about shell-specific environment variable syntax. If you
+prefer setting an environment variable instead, use one of:
+
+* `export FLASK_APP=app.py` (macOS/Linux bash/zsh)
+* `$env:FLASK_APP="app.py"` (Windows PowerShell)
+* `set FLASK_APP=app.py` (Windows Command Prompt)
 
 Then visit http://127.0.0.1:5000/ in your browser.
 
