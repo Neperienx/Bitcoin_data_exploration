@@ -48,8 +48,8 @@ Then visit http://127.0.0.1:5000/ in your browser.
 
 ### 4. Interacting with the dashboard
 
-* The app updates the Parquet dataset on start-up and then every five seconds by requesting fresh candles from Binance.
-* The front-end polls the API every five seconds and redraws the candlestick chart with the newest data.
+* The app updates the Parquet dataset on start-up and then every minute by requesting fresh candles from Binance.
+* The front-end polls the API every minute and redraws the candlestick chart with the newest data.
 * Use the time horizon buttons (1m, 5m, 15m, 1h, 4h) to switch aggregation levels.
 
 ## Development notes
@@ -57,6 +57,23 @@ Then visit http://127.0.0.1:5000/ in your browser.
 * The update routine is idempotent – it only downloads candles that are newer than the most recent entry already saved locally and appends them to `btc_usdt_1m_all.parquet`.
 * Candle aggregation is computed server-side with pandas resampling to ensure accurate OHLCV roll-ups.
 * The API returns compact JSON payloads that the browser renders with Plotly.
+
+## Preparing machine-learning datasets
+
+Running ``python split_dataset.py`` transforms the consolidated Parquet file into
+a machine-learning friendly folder structure:
+
+```
+data/
+├── btc_usdt_1m_all.parquet  # canonical consolidated dataset
+└── ml/
+    ├── train.parquet        # chronological 80% training split
+    └── test.parquet         # chronological 20% test split
+```
+
+The split is chronological to avoid leaking future information into the
+training set.  You can customise the train/test ratio or the output directory
+via ``--train-ratio`` and ``--output-dir`` command-line flags.
 
 ## Next steps
 
