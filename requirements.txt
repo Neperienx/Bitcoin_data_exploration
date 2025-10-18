@@ -3,3 +3,4 @@ pandas>=2.0
 requests>=2.31
 pyarrow>=12.0
 plotly>=5.18
+scikit-learn>=1.3
