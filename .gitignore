@@ -1,0 +1,21 @@
+# Ignore database files
+*.db
+
+# Ignore Python cache directories
+__pycache__/
+*.pyc
+*.pyo
+
+# Optional: ignore virtual environments
+.venv/
+env/
+
+# Optional: ignore IDE / editor settings (common ones)
+.vscode/
+.idea/
+
+
+data/*
+
+.visualization_color*
+visualization_color*
