@@ -67,13 +67,31 @@ a machine-learning friendly folder structure:
 data/
 ├── btc_usdt_1m_all.parquet  # canonical consolidated dataset
 └── ml/
-    ├── train.parquet        # chronological 80% training split
-    └── test.parquet         # chronological 20% test split
+    ├── train.parquet        # all history except the most recent year
+    └── test.parquet         # the most recent year of candles
 ```
 
 The split is chronological to avoid leaking future information into the
-training set.  You can customise the train/test ratio or the output directory
-via ``--train-ratio`` and ``--output-dir`` command-line flags.
+training set.  ``train.parquet`` contains every candle strictly older than one
+year from the latest timestamp in the dataset, while ``test.parquet`` captures
+the final twelve months.  You can override the output directory via the
+``--output-dir`` command-line flag.
+
+## Training the logistic regression baseline
+
+The dashboard's *Logistic regression* tab requires a trained model artifact at
+``models/artifacts/logreg.pkl``.  You can produce it with the bundled training
+script once the canonical dataset exists:
+
+```bash
+python models/logistic_regression.py
+```
+
+The script derives features, splits the data chronologically, trains the model,
+prints basic evaluation metrics, and writes the artifact to the expected
+location.  Restart the Flask application afterwards and the tab will display
+fresh predictions instead of the "Logistic regression model is unavailable."
+message.
 
 ## Next steps
 
