@@ -38,6 +38,14 @@ logreg_latest_sample: Dict[str, object] | None = None
 FORECAST_MAX_STEPS = 120
 
 
+def _empty_candles_frame() -> pd.DataFrame:
+    """Return a dataframe with the expected candle columns but no rows."""
+
+    return pd.DataFrame(
+        columns=["timestamp", "open", "high", "low", "close", "volume", "datetime"]
+    )
+
+
 def _ensure_logreg_model_loaded() -> None:
     """Lazy-load the logistic regression model if the artifact exists."""
 
@@ -308,8 +316,14 @@ def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _read_local_dataset() -> pd.DataFrame:
     if not DATA_FILE.exists():
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "datetime"])
-    df = pd.read_parquet(DATA_FILE)
+        return _empty_candles_frame()
+    try:
+        df = pd.read_parquet(DATA_FILE)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.warning(
+            "Failed to read parquet dataset %s (%s); treating as empty.", DATA_FILE, exc
+        )
+        return _empty_candles_frame()
     return _normalise_columns(df)
 
 
