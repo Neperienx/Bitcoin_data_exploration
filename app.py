@@ -27,16 +27,23 @@ from models.random_forest import (
     load_model as load_rf_model,
     predict_rf,
 )
+from models.xgboost_model import (
+    FEATURE_ORDER as XGB_FEATURE_ORDER,
+    load_model as load_xgb_model,
+    predict_xgb,
+)
 
 APP_UPDATE_INTERVAL = 60  # seconds
 DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
 LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
 RF_MODEL_PATH = Path("models/artifacts/rf.pkl")
+XGB_MODEL_PATH = Path("models/artifacts/xgb.pkl")
 DEFAULT_LOOKBACK = timedelta(days=7)
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
 MAX_KLINES = 1000
 LOGREG_CONTEXT_WINDOW = 60
 RF_CONTEXT_WINDOW = 60
+XGB_CONTEXT_WINDOW = 60
 
 app = Flask(__name__)
 
@@ -45,10 +52,13 @@ background_started = False
 candles_df: pd.DataFrame | None = None
 logreg_model = None
 rf_model = None
+xgb_model = None
 logreg_samples: List[Dict[str, object]] = []
 logreg_latest_sample: Dict[str, object] | None = None
 rf_samples: List[Dict[str, object]] = []
 rf_latest_sample: Dict[str, object] | None = None
+xgb_samples: List[Dict[str, object]] = []
+xgb_latest_sample: Dict[str, object] | None = None
 FORECAST_MAX_STEPS = 120
 
 
@@ -301,6 +311,127 @@ def _recompute_rf_cache(df: pd.DataFrame | None) -> None:
     with data_lock:
         rf_samples = samples
         rf_latest_sample = latest_record
+
+
+def _ensure_xgb_model_loaded() -> None:
+    """Lazy-load the XGBoost model if the artifact exists."""
+
+    global xgb_model
+    if xgb_model is not None:
+        return
+    if not XGB_MODEL_PATH.exists():
+        return
+    try:
+        xgb_model = load_xgb_model(XGB_MODEL_PATH)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.warning("Failed to load XGBoost model: %s", exc)
+        xgb_model = None
+
+
+def _recompute_xgb_cache(df: pd.DataFrame | None) -> None:
+    """Update cached XGBoost samples for the web UI."""
+
+    global xgb_samples, xgb_latest_sample
+
+    if df is None or df.empty:
+        with data_lock:
+            xgb_samples = []
+            xgb_latest_sample = None
+        return
+
+    _ensure_xgb_model_loaded()
+    if xgb_model is None:
+        with data_lock:
+            xgb_samples = []
+            xgb_latest_sample = None
+        return
+
+    try:
+        features = make_basic_features(df)
+        labels = make_label(df, horizon=5)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.warning("Failed to prepare features for XGBoost: %s", exc)
+        with data_lock:
+            xgb_samples = []
+            xgb_latest_sample = None
+        return
+
+    dataset = pd.concat(
+        [
+            features,
+            labels.rename("label"),
+            df[["timestamp", "datetime", "close"]],
+        ],
+        axis=1,
+    )
+    dataset = dataset.dropna(subset=XGB_FEATURE_ORDER + ["label"])
+
+    samples: List[Dict[str, object]] = []
+    if not dataset.empty:
+        X = dataset.loc[:, XGB_FEATURE_ORDER]
+        y = dataset.loc[:, "label"].astype(int)
+        X_train, X_test, y_train, y_test = time_train_test_split(X, y)
+        if not X_test.empty:
+            preds = predict_xgb(xgb_model, X_test)
+            try:
+                probs = xgb_model.predict_proba(X_test)[:, 1]
+            except Exception:  # pragma: no cover - fallback for unexpected models
+                probs = preds.astype(float)
+            meta = dataset.loc[X_test.index, ["timestamp", "datetime", "close"]].copy()
+            meta["ground_truth"] = y_test
+            meta["prediction"] = preds
+            meta["probability"] = probs
+            for feature in XGB_FEATURE_ORDER:
+                meta[feature] = dataset.loc[X_test.index, feature]
+            meta["anchor_timestamp"] = dataset.loc[X_test.index, "timestamp"].astype("int64")
+            samples = [
+                {
+                    "mode": "random",
+                    "timestamp": int(row["timestamp"]),
+                    "datetime": pd.to_datetime(row["datetime"]).isoformat(),
+                    "close": float(row["close"]),
+                    "ground_truth": int(row["ground_truth"]),
+                    "prediction": int(row["prediction"]),
+                    "probability": float(row["probability"]),
+                    "features": {
+                        feature: float(row[feature]) for feature in XGB_FEATURE_ORDER
+                    },
+                    "anchor_timestamp": int(row["anchor_timestamp"]),
+                }
+                for _, row in meta.iterrows()
+            ]
+
+    latest_record: Dict[str, object] | None = None
+    feature_view = features.loc[:, XGB_FEATURE_ORDER].dropna()
+    if not feature_view.empty:
+        latest_index = feature_view.index[-1]
+        latest_row = feature_view.loc[[latest_index]]
+        latest_pred = int(predict_xgb(xgb_model, latest_row)[0])
+        try:
+            latest_prob = float(xgb_model.predict_proba(latest_row)[:, 1][0])
+        except Exception:  # pragma: no cover - fallback for unexpected models
+            latest_prob = float(latest_pred)
+        label_value = labels.loc[latest_index] if latest_index in labels.index else None
+        ground_truth = None
+        if label_value is not None and not pd.isna(label_value):
+            ground_truth = int(label_value)
+        latest_record = {
+            "mode": "latest",
+            "timestamp": int(df.loc[latest_index, "timestamp"]),
+            "datetime": pd.to_datetime(df.loc[latest_index, "datetime"]).isoformat(),
+            "close": float(df.loc[latest_index, "close"]),
+            "ground_truth": ground_truth,
+            "prediction": latest_pred,
+            "probability": latest_prob,
+            "features": {
+                feature: float(latest_row.iloc[0][feature]) for feature in XGB_FEATURE_ORDER
+            },
+            "anchor_timestamp": int(df.loc[latest_index, "timestamp"]),
+        }
+
+    with data_lock:
+        xgb_samples = samples
+        xgb_latest_sample = latest_record
 
 
 def _ensure_candles_ready(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -563,6 +694,7 @@ def update_dataset() -> bool:
 
     _recompute_logreg_cache(combined.copy())
     _recompute_rf_cache(combined.copy())
+    _recompute_xgb_cache(combined.copy())
     return True
 
 
@@ -573,6 +705,7 @@ def ensure_dataset_loaded() -> None:
         candles_df = df
     _recompute_logreg_cache(df.copy())
     _recompute_rf_cache(df.copy())
+    _recompute_xgb_cache(df.copy())
     try:
         update_dataset()
     except requests.RequestException as exc:
@@ -836,6 +969,135 @@ def api_logreg_forecast():
     )
 
 
+@app.route("/api/xgb/sample")
+def api_xgb_sample():
+    mode = request.args.get("mode", "random").lower()
+    horizon_minutes = _extract_minutes(request.args)
+
+    _ensure_xgb_model_loaded()
+
+    with data_lock:
+        model_available = xgb_model is not None
+        samples = [sample.copy() for sample in xgb_samples]
+        latest = xgb_latest_sample.copy() if xgb_latest_sample else None
+        df = candles_df.copy() if candles_df is not None else pd.DataFrame()
+
+    if not model_available:
+        return jsonify({"error": "XGBoost model is unavailable."}), 503
+
+    prepared = _ensure_candles_ready(df)
+    if prepared.empty:
+        return jsonify({"error": "No candle data available."}), 503
+    ordered = prepared.sort_values("timestamp").reset_index(drop=True)
+
+    if mode == "latest":
+        if latest is None:
+            return jsonify({"error": "Latest sample unavailable."}), 404
+        payload = latest.copy()
+        payload["mode"] = "latest"
+    else:
+        if not samples:
+            return jsonify({"error": "No evaluation samples available."}), 404
+        payload = random.choice(samples)
+        payload["mode"] = "random"
+
+    anchor_ts = int(payload.get("anchor_timestamp", payload.get("timestamp", 0)))
+    matches = ordered.index[ordered["timestamp"] == anchor_ts]
+    if matches.empty:
+        return jsonify({"error": "Anchor candle unavailable in dataset."}), 404
+
+    anchor_pos = int(matches[-1])
+    history_full = ordered.iloc[: anchor_pos + 1].copy()
+    if history_full.empty:
+        return jsonify({"error": "Not enough history to generate sample context."}), 503
+
+    forecasts = _forecast_candles(
+        xgb_model,
+        history_full,
+        horizon_minutes,
+        feature_order=XGB_FEATURE_ORDER,
+    )
+    if not forecasts:
+        return jsonify({"error": "Unable to generate forecast."}), 500
+
+    history_preview = history_full.tail(XGB_CONTEXT_WINDOW)
+    gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
+
+    payload["horizon_minutes"] = len(forecasts)
+    payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
+    payload["forecast_candles"] = _serialise_forecast(forecasts)
+    payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+
+    return jsonify(payload)
+
+
+@app.route("/api/xgb/forecast")
+def api_xgb_forecast():
+    mode = request.args.get("mode", "random").lower()
+    steps = _extract_minutes(request.args)
+
+    with data_lock:
+        df = candles_df.copy() if candles_df is not None else pd.DataFrame()
+
+    if df.empty:
+        return jsonify({"error": "No candle data available."}), 503
+
+    prepared = _ensure_candles_ready(df)
+    if prepared.empty:
+        return jsonify({"error": "No candle data available."}), 503
+
+    if mode not in {"latest", "random"}:
+        return jsonify({"error": f"Unsupported forecast mode: {mode}"}), 400
+
+    if mode == "latest":
+        anchor_idx = len(prepared) - 1
+    else:
+        if len(prepared) < steps + 2:
+            return jsonify({"error": "Not enough historical data for random forecast."}), 503
+        anchor_idx = random.randint(0, len(prepared) - steps - 2)
+
+    anchor_row = prepared.iloc[anchor_idx]
+    history = prepared.iloc[: anchor_idx + 1]
+
+    _ensure_xgb_model_loaded()
+    if xgb_model is None:
+        return jsonify({"error": "XGBoost model is unavailable."}), 503
+
+    forecasts = _forecast_candles(
+        xgb_model,
+        history,
+        steps,
+        feature_order=XGB_FEATURE_ORDER,
+    )
+    if not forecasts:
+        return jsonify({"error": "Unable to generate forecast."}), 500
+
+    ground_truth: List[Dict[str, object]] = []
+    if mode == "random":
+        gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
+        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+
+    anchor_payload = {
+        "timestamp": int(anchor_row["timestamp"]),
+        "datetime": pd.to_datetime(anchor_row["datetime"]).isoformat(),
+        "close": float(anchor_row["close"]),
+    }
+
+    history_preview = history.tail(XGB_CONTEXT_WINDOW)
+
+    return jsonify(
+        {
+            "mode": mode,
+            "steps": len(forecasts),
+            "anchor": anchor_payload,
+            "forecast": _serialise_forecast(forecasts),
+            "ground_truth_candles": ground_truth,
+            "history_candles": _serialise_candles(history_preview.to_dict("records")),
+            "horizon_minutes": len(forecasts),
+        }
+    )
+
+
 @app.route("/api/rf/sample")
 def api_rf_sample():
     mode = request.args.get("mode", "random").lower()
@@ -1015,6 +1277,22 @@ def index():
           .toggle { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; user-select: none; }
           .toggle input { width: 1.1rem; height: 1.1rem; }
           .logreg-forecast { margin-top: 2rem; }
+          .xgb-controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+          .xgb-card { background: #111827; border-radius: 1rem; padding: 1.5rem; border: 1px solid rgba(148,163,184,0.2); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.35); }
+          .xgb-card h2 { margin-top: 0; margin-bottom: 0.5rem; font-size: 1.3rem; }
+          .xgb-time { margin: 0; font-size: 0.95rem; color: #cbd5f5; }
+          .xgb-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin: 1.25rem 0; }
+          .xgb-metrics div { background: #0f172a; border-radius: 0.9rem; padding: 0.9rem 1rem; border: 1px solid rgba(148,163,184,0.2); }
+          .xgb-metrics h3 { margin: 0 0 0.4rem 0; font-size: 0.9rem; color: #cbd5f5; }
+          .xgb-metrics .value { margin: 0; font-size: 1.4rem; font-weight: 600; }
+          .xgb-features h3 { margin: 0 0 0.6rem 0; }
+          .xgb-features ul { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem; }
+          .xgb-features li { background: #0f172a; border-radius: 0.8rem; padding: 0.6rem 0.8rem; border: 1px solid rgba(148,163,184,0.2); font-size: 0.9rem; }
+          .xgb-sample-chart { margin-top: 1.5rem; }
+          .xgb-sample-chart h3 { margin: 0 0 0.6rem 0; font-size: 1rem; }
+          #xgb-sample-chart { width: 100%; height: 45vh; }
+          .xgb-forecast { margin-top: 2rem; }
+          #xgb-forecast-chart { width: 100%; height: 60vh; }
           .forecast-controls { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
           .forecast-controls label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; }
           .forecast-controls input { background: #0f172a; border: 1px solid rgba(148,163,184,0.3); border-radius: 0.5rem; padding: 0.45rem 0.6rem; color: #e2e8f0; width: 5.5rem; }
@@ -1046,6 +1324,7 @@ def index():
           <div class="tabs">
             <button class="tab-button active" data-tab="candles">Candlestick chart</button>
             <button class="tab-button" data-tab="logreg">Logistic regression</button>
+            <button class="tab-button" data-tab="xgb">XGBoost</button>
             <button class="tab-button" data-tab="rf">Random forest</button>
           </div>
           <section id="candles-tab" class="tab-content active">
@@ -1108,6 +1387,57 @@ def index():
               </div>
               <div class="status" id="forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
               <div id="forecast-chart"></div>
+            </div>
+          </section>
+          <section id="xgb-tab" class="tab-content">
+            <div class="xgb-controls">
+              <button id="xgb-refresh">Pick random sample</button>
+              <label class="toggle">
+                <input type="checkbox" id="xgb-latest-toggle">
+                <span>Use latest candle</span>
+              </label>
+            </div>
+            <div class="status" id="xgb-status">Activate the tab to load XGBoost insights.</div>
+            <div id="xgb-card" class="xgb-card" hidden>
+              <h2>XGBoost signal</h2>
+              <p class="xgb-time" id="xgb-time"></p>
+              <div class="xgb-metrics">
+                <div>
+                  <h3>Ground truth</h3>
+                  <p id="xgb-ground-truth" class="value"></p>
+                </div>
+                <div>
+                  <h3>Prediction</h3>
+                  <p id="xgb-prediction" class="value"></p>
+                </div>
+                <div>
+                  <h3>Up probability</h3>
+                  <p id="xgb-probability" class="value"></p>
+                </div>
+              </div>
+              <div class="xgb-features">
+                <h3>Feature values</h3>
+                <ul id="xgb-feature-list"></ul>
+              </div>
+              <div class="xgb-sample-chart">
+                <h3>Model input and predicted candles</h3>
+                <div id="xgb-sample-chart"></div>
+              </div>
+            </div>
+            <div class="xgb-forecast">
+              <div class="forecast-controls">
+                <label>
+                  Forecast horizon (minutes)
+                  <input type="number" id="xgb-forecast-steps" min="1" max="120" value="15">
+                </label>
+                <button id="xgb-forecast-run">Run forecast</button>
+                <label class="toggle">
+                  <input type="checkbox" id="xgb-forecast-latest-toggle">
+                  <span>Forecast from latest candle</span>
+                </label>
+              </div>
+              <div class="status" id="xgb-forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div id="xgb-forecast-chart"></div>
             </div>
           </section>
           <section id="rf-tab" class="tab-content">
@@ -1180,6 +1510,21 @@ def index():
           const forecastStepsInput = document.getElementById('forecast-steps');
           const forecastStatus = document.getElementById('forecast-status');
           const forecastToggle = document.getElementById('forecast-latest-toggle');
+          const xgbRefreshButton = document.getElementById('xgb-refresh');
+          const xgbToggle = document.getElementById('xgb-latest-toggle');
+          const xgbStatus = document.getElementById('xgb-status');
+          const xgbCard = document.getElementById('xgb-card');
+          const xgbTime = document.getElementById('xgb-time');
+          const xgbGroundTruth = document.getElementById('xgb-ground-truth');
+          const xgbPrediction = document.getElementById('xgb-prediction');
+          const xgbProbability = document.getElementById('xgb-probability');
+          const xgbFeatureList = document.getElementById('xgb-feature-list');
+          const xgbSampleChart = document.getElementById('xgb-sample-chart');
+          const xgbForecastRunButton = document.getElementById('xgb-forecast-run');
+          const xgbForecastStepsInput = document.getElementById('xgb-forecast-steps');
+          const xgbForecastStatus = document.getElementById('xgb-forecast-status');
+          const xgbForecastToggle = document.getElementById('xgb-forecast-latest-toggle');
+          const xgbForecastChart = document.getElementById('xgb-forecast-chart');
           const rfRefreshButton = document.getElementById('rf-refresh');
           const rfToggle = document.getElementById('rf-latest-toggle');
           const rfStatus = document.getElementById('rf-status');
@@ -1197,6 +1542,7 @@ def index():
           const rfForecastChart = document.getElementById('rf-forecast-chart');
           let currentInterval = '1m';
           let logregHasLoaded = false;
+          let xgbHasLoaded = false;
           let rfHasLoaded = false;
 
           tabButtons.forEach(btn => {
@@ -1209,6 +1555,11 @@ def index():
                 loadLogregSample();
                 runForecast(true);
                 logregHasLoaded = true;
+              } else if (target === 'xgb' && !xgbHasLoaded) {
+                updateXgbControls();
+                loadXgbSample();
+                runXgbForecast(true);
+                xgbHasLoaded = true;
               } else if (target === 'rf' && !rfHasLoaded) {
                 updateRfControls();
                 loadRfSample();
@@ -1267,6 +1618,51 @@ def index():
               if (event.key === 'Enter') {
                 event.preventDefault();
                 runForecast();
+              }
+            });
+          }
+
+          function updateXgbControls() {
+            if (!xgbRefreshButton) return;
+            const useLatest = xgbToggle && xgbToggle.checked;
+            xgbRefreshButton.disabled = !!useLatest;
+            if (xgbRefreshButton.disabled) {
+              xgbRefreshButton.title = 'Disable the toggle to draw a random test example.';
+            } else {
+              xgbRefreshButton.title = '';
+            }
+          }
+
+          if (xgbRefreshButton) {
+            xgbRefreshButton.addEventListener('click', () => {
+              loadXgbSample();
+            });
+          }
+
+          if (xgbToggle) {
+            xgbToggle.addEventListener('change', () => {
+              updateXgbControls();
+              loadXgbSample();
+            });
+          }
+
+          if (xgbForecastRunButton) {
+            xgbForecastRunButton.addEventListener('click', () => {
+              runXgbForecast();
+            });
+          }
+
+          if (xgbForecastToggle) {
+            xgbForecastToggle.addEventListener('change', () => {
+              runXgbForecast();
+            });
+          }
+
+          if (xgbForecastStepsInput) {
+            xgbForecastStepsInput.addEventListener('keydown', event => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                runXgbForecast();
               }
             });
           }
@@ -1613,6 +2009,289 @@ def index():
             };
 
             Plotly.react('logreg-sample-chart', traces, layout, { responsive: true, displaylogo: false });
+          }
+
+          function getXgbForecastMinutes() {
+            const rawValue = xgbForecastStepsInput ? Number(xgbForecastStepsInput.value) : 15;
+            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
+            if (xgbForecastStepsInput) {
+              xgbForecastStepsInput.value = bounded;
+            }
+            return bounded;
+          }
+
+          async function runXgbForecast(auto = false) {
+            if (!xgbForecastStatus) return;
+            const bounded = getXgbForecastMinutes();
+            const mode = xgbForecastToggle && xgbForecastToggle.checked ? 'latest' : 'random';
+            xgbForecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
+            if (xgbForecastRunButton) {
+              xgbForecastRunButton.disabled = true;
+            }
+            try {
+              const response = await fetch(`/api/xgb/forecast?minutes=${bounded}&mode=${mode}`);
+              const payload = await response.json();
+              if (!response.ok || payload.error) {
+                throw new Error(payload.error || `API error ${response.status}`);
+              }
+              renderXgbForecast(payload);
+            } catch (error) {
+              console.error(error);
+              xgbForecastStatus.textContent = error.message || 'Forecast unavailable.';
+              if (!auto && window.Plotly) {
+                Plotly.purge('xgb-forecast-chart');
+              }
+            } finally {
+              if (xgbForecastRunButton) {
+                xgbForecastRunButton.disabled = false;
+              }
+            }
+          }
+
+          function renderXgbForecast(data) {
+            if (!xgbForecastStatus) return;
+            const forecast = Array.isArray(data.forecast) ? data.forecast : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : Array.isArray(data.ground_truth) ? data.ground_truth : [];
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
+            if (!forecast.length) {
+              xgbForecastStatus.textContent = 'Forecast unavailable.';
+              if (window.Plotly) {
+                Plotly.purge('xgb-forecast-chart');
+              }
+              return;
+            }
+
+            const anchorDate = data.anchor && data.anchor.datetime ? new Date(data.anchor.datetime) : null;
+            const statusParts = [];
+            if (anchorDate && !Number.isNaN(anchorDate.getTime())) {
+              statusParts.push(`Anchor candle: ${anchorDate.toLocaleString()}`);
+            }
+            statusParts.push(data.mode === 'latest' ? 'Mode: latest forecast' : 'Mode: historical evaluation');
+            if (typeof data.horizon_minutes === 'number') {
+              statusParts.push(`Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}`);
+            }
+            if (groundTruth.length === forecast.length && groundTruth.length) {
+              statusParts.push('Ground truth overlay available.');
+            } else if (groundTruth.length) {
+              statusParts.push('Partial ground truth available.');
+            } else {
+              statusParts.push('Ground truth unavailable for this horizon.');
+            }
+            const lastForecast = forecast[forecast.length - 1];
+            if (lastForecast && typeof lastForecast.probability === 'number') {
+              statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
+            }
+            xgbForecastStatus.textContent = statusParts.join(' · ');
+
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.5,
+              });
+            }
+
+            const forecastTrace = {
+              x: forecast.map(c => c.datetime),
+              open: forecast.map(c => c.open),
+              high: forecast.map(c => c.high),
+              low: forecast.map(c => c.low),
+              close: forecast.map(c => c.close),
+              type: 'candlestick',
+              name: 'Forecast',
+              increasing: { line: { color: '#a855f7' } },
+              decreasing: { line: { color: '#f59e0b' } },
+              opacity: 0.65,
+            };
+            traces.push(forecastTrace);
+
+            if (groundTruth.length) {
+              traces.push({
+                x: groundTruth.map(c => c.datetime),
+                open: groundTruth.map(c => c.open),
+                high: groundTruth.map(c => c.high),
+                low: groundTruth.map(c => c.low),
+                close: groundTruth.map(c => c.close),
+                type: 'candlestick',
+                name: 'Ground truth',
+                increasing: { line: { color: '#22c55e' } },
+                decreasing: { line: { color: '#ef4444' } },
+                opacity: 0.85,
+              });
+            }
+
+            const layout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 30, t: 30, b: 50 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+              xaxis: { rangeslider: { visible: false } },
+              yaxis: { fixedrange: false, title: 'Price (USDT)' },
+            };
+
+            if (window.Plotly) {
+              Plotly.react('xgb-forecast-chart', traces, layout, { responsive: true, displaylogo: false });
+            }
+          }
+
+          async function loadXgbSample() {
+            if (!xgbStatus) return;
+            const useLatest = xgbToggle && xgbToggle.checked;
+            const mode = useLatest ? 'latest' : 'random';
+            xgbStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
+            xgbCard.hidden = true;
+            try {
+              const minutes = getXgbForecastMinutes();
+              const response = await fetch(`/api/xgb/sample?mode=${mode}&minutes=${minutes}`);
+              const payload = await response.json();
+              if (!response.ok || payload.error) {
+                throw new Error(payload.error || `API error ${response.status}`);
+              }
+              renderXgbSample(payload);
+            } catch (error) {
+              console.error(error);
+              xgbStatus.textContent = error.message || 'XGBoost data unavailable.';
+              if (window.Plotly) {
+                Plotly.purge('xgb-sample-chart');
+              }
+            }
+          }
+
+          function renderXgbSample(data) {
+            const mode = data.mode || (xgbToggle && xgbToggle.checked ? 'latest' : 'random');
+            if (mode === 'random') {
+              if (data.ground_truth === null || data.ground_truth === undefined) {
+                xgbStatus.textContent = 'Random test sample. Ground truth unavailable.';
+              } else if (Number(data.ground_truth) === Number(data.prediction)) {
+                xgbStatus.textContent = 'Random test sample · Prediction matched the ground truth.';
+              } else {
+                xgbStatus.textContent = 'Random test sample · Prediction differed from the ground truth.';
+              }
+            } else {
+              xgbStatus.textContent = 'Latest candle prediction (ground truth may not yet exist).';
+            }
+
+            if (typeof data.horizon_minutes === 'number') {
+              xgbStatus.textContent += ` Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}.`;
+            }
+
+            const ts = data.datetime;
+            const date = new Date(ts);
+            const humanTime = Number.isNaN(date.getTime()) ? ts : date.toLocaleString();
+            const closePrice = typeof data.close === 'number' ? data.close : Number(data.close);
+            const priceText = Number.isFinite(closePrice) ? closePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : 'N/A';
+            xgbTime.textContent = `Candle time: ${humanTime} · Close: ${priceText} USDT`;
+
+            applyOutcome(xgbGroundTruth, data.ground_truth);
+            applyOutcome(xgbPrediction, data.prediction);
+
+            if (typeof data.probability === 'number' && Number.isFinite(data.probability)) {
+              const percentage = (data.probability * 100).toFixed(1);
+              xgbProbability.textContent = `${percentage}% up`;
+            } else {
+              xgbProbability.textContent = 'N/A';
+            }
+
+            xgbFeatureList.innerHTML = '';
+            const features = data.features || {};
+            Object.entries(features).forEach(([name, value]) => {
+              const li = document.createElement('li');
+              let display = Number(value);
+              if (!Number.isFinite(display)) {
+                li.textContent = `${name}: ${value}`;
+              } else {
+                li.textContent = `${name}: ${display.toFixed(4)}`;
+              }
+              xgbFeatureList.appendChild(li);
+            });
+
+            renderXgbSampleChart(data);
+            xgbCard.hidden = false;
+          }
+
+          function renderXgbSampleChart(data) {
+            if (!xgbSampleChart || !window.Plotly) {
+              return;
+            }
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
+            const forecast = Array.isArray(data.forecast_candles) ? data.forecast_candles : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : [];
+
+            if (!history.length && !forecast.length) {
+              Plotly.purge('xgb-sample-chart');
+              return;
+            }
+
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.55,
+              });
+            }
+
+            if (forecast.length) {
+              traces.push({
+                x: forecast.map(c => c.datetime),
+                open: forecast.map(c => c.open),
+                high: forecast.map(c => c.high),
+                low: forecast.map(c => c.low),
+                close: forecast.map(c => c.close),
+                type: 'candlestick',
+                name: 'Forecast',
+                increasing: { line: { color: '#a855f7' } },
+                decreasing: { line: { color: '#f97316' } },
+                opacity: 0.75,
+              });
+            }
+
+            if (groundTruth.length) {
+              traces.push({
+                x: groundTruth.map(c => c.datetime),
+                open: groundTruth.map(c => c.open),
+                high: groundTruth.map(c => c.high),
+                low: groundTruth.map(c => c.low),
+                close: groundTruth.map(c => c.close),
+                type: 'candlestick',
+                name: 'Ground truth',
+                increasing: { line: { color: '#22c55e' } },
+                decreasing: { line: { color: '#ef4444' } },
+                opacity: 0.85,
+              });
+            }
+
+            const layout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 30, t: 30, b: 40 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+              xaxis: { rangeslider: { visible: false } },
+              yaxis: { fixedrange: false, title: 'Price (USDT)' },
+            };
+
+            Plotly.react('xgb-sample-chart', traces, layout, { responsive: true, displaylogo: false });
           }
 
           function getRfForecastMinutes() {
