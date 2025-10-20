@@ -40,21 +40,46 @@ class LSTMTrainingConfig:
 
 
 class _SequenceDataset(Dataset):
-    """Torch dataset wrapping feature sequences and binary labels."""
+    """Dataset that builds sequences lazily from a 2D array of features."""
 
-    def __init__(self, sequences: np.ndarray, labels: np.ndarray) -> None:
-        if sequences.ndim != 3:
-            raise ValueError("Expected sequences with shape (n, seq_len, n_features)")
-        if len(sequences) != len(labels):
-            raise ValueError("Sequences and labels must have matching lengths")
-        self.sequences = torch.tensor(sequences, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.float32)
+    def __init__(
+        self,
+        values: np.ndarray,
+        sequence_length: int,
+        labels: Optional[np.ndarray] = None,
+    ) -> None:
+        if values.ndim != 2:
+            raise ValueError("Expected feature matrix with shape (n_samples, n_features)")
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+
+        self.sequence_length = sequence_length
+        self._np_values = values
+        self.values = torch.as_tensor(self._np_values, dtype=torch.float32)
+        self.num_sequences = max(self.values.shape[0] - sequence_length + 1, 0)
+
+        self.labels: Optional[torch.Tensor]
+        self._np_labels: Optional[np.ndarray] = None
+        if labels is None:
+            self.labels = None
+        else:
+            if len(labels) != self.num_sequences:
+                raise ValueError("Labels must align with available sequences")
+            self._np_labels = labels
+            self.labels = torch.as_tensor(self._np_labels, dtype=torch.float32)
 
     def __len__(self) -> int:  # pragma: no cover - simple proxy
-        return len(self.sequences)
+        return self.num_sequences
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.sequences[idx], self.labels[idx]
+    def __getitem__(self, idx: int):  # pragma: no cover - thin wrapper
+        if idx < 0 or idx >= self.num_sequences:
+            raise IndexError("Sequence index out of range")
+        start = idx
+        end = idx + self.sequence_length
+        seq = self.values[start:end]
+        if self.labels is None:
+            return seq
+        return seq, self.labels[idx]
 
 
 class _LSTMClassifier(nn.Module):
@@ -94,30 +119,6 @@ def _ensure_series(y: pd.Series | Sequence) -> pd.Series:
     return pd.Series(y)
 
 
-def _build_sequences(
-    features: pd.DataFrame,
-    sequence_length: int,
-) -> Tuple[np.ndarray, List[pd.Index]]:
-    if sequence_length <= 0:
-        raise ValueError("sequence_length must be positive")
-    if features.empty:
-        return np.empty((0, sequence_length, len(features.columns))), []
-
-    ordered = features.sort_index()
-    values = ordered.to_numpy(dtype=np.float32)
-    if len(values) < sequence_length:
-        return np.empty((0, sequence_length, values.shape[1])), []
-
-    seqs: List[np.ndarray] = []
-    indices: List[pd.Index] = []
-    for end_pos in range(sequence_length - 1, len(values)):
-        seq = values[end_pos - sequence_length + 1 : end_pos + 1]
-        seqs.append(seq)
-        indices.append(ordered.index[end_pos])
-
-    return np.stack(seqs), indices
-
-
 class LSTMForecaster:
     """Wrapper providing a scikit-like interface around a PyTorch LSTM."""
 
@@ -146,9 +147,19 @@ class LSTMForecaster:
 
     def _prepare_sequences(self, X: pd.DataFrame) -> Tuple[np.ndarray, List[pd.Index]]:
         df = _ensure_dataframe(X).loc[:, self.feature_order]
-        scaled = self.scaler.transform(df)
-        scaled_df = pd.DataFrame(scaled, index=df.index, columns=self.feature_order)
-        return _build_sequences(scaled_df, self.sequence_length)
+        if df.empty:
+            return np.empty((0, len(self.feature_order)), dtype=np.float32), []
+
+        ordered = df.sort_index()
+        scaled = self.scaler.transform(ordered)
+        values = np.asarray(scaled, dtype=np.float32)
+        if not values.flags.c_contiguous:
+            values = np.ascontiguousarray(values, dtype=np.float32)
+        if len(values) < self.sequence_length:
+            return values, []
+
+        indices = list(ordered.index[self.sequence_length - 1 :])
+        return values, indices
 
     def fit(
         self,
@@ -162,12 +173,12 @@ class LSTMForecaster:
         y_series = _ensure_series(y_train)
 
         self.scaler.fit(X_df)
-        sequences, indices = self._prepare_sequences(X_df)
+        values, indices = self._prepare_sequences(X_df)
         if not len(indices):
             raise RuntimeError("Insufficient data to build LSTM sequences")
         y_values = y_series.loc[indices].to_numpy(dtype=np.float32)
 
-        dataset = _SequenceDataset(sequences, y_values)
+        dataset = _SequenceDataset(values, self.sequence_length, y_values)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         criterion = nn.BCEWithLogitsLoss()
@@ -185,16 +196,30 @@ class LSTMForecaster:
                 optimiser.step()
 
     def predict_proba(self, X: pd.DataFrame) -> pd.Series:
-        sequences, indices = self._prepare_sequences(X)
+        values, indices = self._prepare_sequences(X)
         if not len(indices):
             return pd.Series(dtype="float64")
 
-        tensor = torch.tensor(sequences, dtype=torch.float32, device=self.device)
+        dataset = _SequenceDataset(values, self.sequence_length)
+        loader = DataLoader(dataset, batch_size=2048, shuffle=False)
+
+        probabilities = np.empty(len(indices), dtype=np.float32)
+        offset = 0
+
         self.model.eval()
         with torch.no_grad():  # pragma: no branch - inference
-            logits = self.model(tensor)
-            probs = torch.sigmoid(logits).cpu().numpy()
-        return pd.Series(probs.astype(np.float64), index=indices)
+            for batch_x in loader:
+                batch_x = batch_x.to(self.device)
+                logits = self.model(batch_x)
+                probs = torch.sigmoid(logits).cpu().numpy().astype(np.float32, copy=False)
+                batch_size = len(probs)
+                probabilities[offset : offset + batch_size] = probs
+                offset += batch_size
+
+        if offset != len(indices):
+            raise RuntimeError("Failed to compute probabilities for all sequences")
+
+        return pd.Series(probabilities.astype(np.float64), index=indices)
 
     def predict(self, X: pd.DataFrame, threshold: float = 0.5) -> pd.Series:
         probabilities = self.predict_proba(X)
