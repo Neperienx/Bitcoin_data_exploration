@@ -1,6 +1,7 @@
 """Feature engineering helpers for machine learning experiments."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 FEATURE_COLUMNS = ["return_1m", "ma_ratio", "volatility", "volume_z"]
@@ -24,7 +25,9 @@ def make_basic_features(df: pd.DataFrame, window: int = 30) -> pd.DataFrame:
     df["volatility"] = returns.rolling(window=window, min_periods=1).std()
     volume_mean = df["volume"].rolling(window=window, min_periods=1).mean()
     volume_std = df["volume"].rolling(window=window, min_periods=1).std(ddof=0)
-    df["volume_z"] = (df["volume"] - volume_mean) / volume_std.replace(0, pd.NA)
+    safe_volume_std = volume_std.replace(0, np.nan)
+    df["volume_z"] = (df["volume"] - volume_mean) / safe_volume_std
+    df["volume_z"] = df["volume_z"].astype("float64")
 
     return df[FEATURE_COLUMNS]
 
