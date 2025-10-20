@@ -24,6 +24,7 @@ LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
 DEFAULT_LOOKBACK = timedelta(days=7)
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
 MAX_KLINES = 1000
+LOGREG_CONTEXT_WINDOW = 60
 
 app = Flask(__name__)
 
@@ -106,6 +107,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
             meta["probability"] = probs
             for feature in FEATURE_ORDER:
                 meta[feature] = dataset.loc[X_test.index, feature]
+            meta["anchor_timestamp"] = dataset.loc[X_test.index, "timestamp"].astype("int64")
             samples = [
                 {
                     "mode": "random",
@@ -118,6 +120,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
                     "features": {
                         feature: float(row[feature]) for feature in FEATURE_ORDER
                     },
+                    "anchor_timestamp": int(row["anchor_timestamp"]),
                 }
                 for _, row in meta.iterrows()
             ]
@@ -147,6 +150,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
             "features": {
                 feature: float(latest_row.iloc[0][feature]) for feature in FEATURE_ORDER
             },
+            "anchor_timestamp": int(df.loc[latest_index, "timestamp"]),
         }
 
     with data_lock:
@@ -536,41 +540,79 @@ def api_candles() -> Dict[str, object]:
     )
 
 
+def _coerce_minutes(value: str | None, default: int = 15) -> int:
+    try:
+        minutes = int(value) if value is not None else default
+    except ValueError:
+        minutes = default
+    return max(1, min(minutes, FORECAST_MAX_STEPS))
+
+
+def _extract_minutes(args) -> int:
+    if "minutes" in args:
+        return _coerce_minutes(args.get("minutes"))
+    return _coerce_minutes(args.get("steps"))
+
+
 @app.route("/api/logreg/sample")
 def api_logreg_sample():
     mode = request.args.get("mode", "random").lower()
+    horizon_minutes = _extract_minutes(request.args)
 
     with data_lock:
         model_available = logreg_model is not None
         samples = [sample.copy() for sample in logreg_samples]
         latest = logreg_latest_sample.copy() if logreg_latest_sample else None
+        df = candles_df.copy() if candles_df is not None else pd.DataFrame()
 
     if not model_available:
         return jsonify({"error": "Logistic regression model is unavailable."}), 503
+
+    prepared = _ensure_candles_ready(df)
+    if prepared.empty:
+        return jsonify({"error": "No candle data available."}), 503
+    ordered = prepared.sort_values("timestamp").reset_index(drop=True)
 
     if mode == "latest":
         if latest is None:
             return jsonify({"error": "Latest sample unavailable."}), 404
         payload = latest.copy()
         payload["mode"] = "latest"
-        return jsonify(payload)
+    else:
+        if not samples:
+            return jsonify({"error": "No evaluation samples available."}), 404
+        payload = random.choice(samples)
+        payload["mode"] = "random"
 
-    if not samples:
-        return jsonify({"error": "No evaluation samples available."}), 404
+    anchor_ts = int(payload.get("anchor_timestamp", payload.get("timestamp", 0)))
+    matches = ordered.index[ordered["timestamp"] == anchor_ts]
+    if matches.empty:
+        return jsonify({"error": "Anchor candle unavailable in dataset."}), 404
 
-    payload = random.choice(samples)
-    payload["mode"] = "random"
+    anchor_pos = int(matches[-1])
+    history_full = ordered.iloc[: anchor_pos + 1].copy()
+    if history_full.empty:
+        return jsonify({"error": "Not enough history to generate sample context."}), 503
+
+    forecasts = _forecast_candles(logreg_model, history_full, horizon_minutes)
+    if not forecasts:
+        return jsonify({"error": "Unable to generate forecast."}), 500
+
+    history_preview = history_full.tail(LOGREG_CONTEXT_WINDOW)
+    gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
+
+    payload["horizon_minutes"] = len(forecasts)
+    payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
+    payload["forecast_candles"] = _serialise_forecast(forecasts)
+    payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+
     return jsonify(payload)
 
 
 @app.route("/api/logreg/forecast")
 def api_logreg_forecast():
     mode = request.args.get("mode", "random").lower()
-    try:
-        steps = int(request.args.get("steps", "15"))
-    except ValueError:
-        steps = 15
-    steps = max(1, min(steps, FORECAST_MAX_STEPS))
+    steps = _extract_minutes(request.args)
 
     with data_lock:
         df = candles_df.copy() if candles_df is not None else pd.DataFrame()
@@ -614,13 +656,17 @@ def api_logreg_forecast():
         "close": float(anchor_row["close"]),
     }
 
+    history_preview = history.tail(LOGREG_CONTEXT_WINDOW)
+
     return jsonify(
         {
             "mode": mode,
             "steps": len(forecasts),
             "anchor": anchor_payload,
             "forecast": _serialise_forecast(forecasts),
-            "ground_truth": ground_truth,
+            "ground_truth_candles": ground_truth,
+            "history_candles": _serialise_candles(history_preview.to_dict("records")),
+            "horizon_minutes": len(forecasts),
         }
     )
 
@@ -669,6 +715,9 @@ def index():
           .logreg-features h3 { margin: 0 0 0.6rem 0; }
           .logreg-features ul { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem; }
           .logreg-features li { background: #0f172a; border-radius: 0.8rem; padding: 0.6rem 0.8rem; border: 1px solid rgba(148,163,184,0.2); font-size: 0.9rem; }
+          .logreg-sample-chart { margin-top: 1.5rem; }
+          .logreg-sample-chart h3 { margin: 0 0 0.6rem 0; font-size: 1rem; }
+          #logreg-sample-chart { width: 100%; height: 45vh; }
           .toggle { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; user-select: none; }
           .toggle input { width: 1.1rem; height: 1.1rem; }
           .logreg-forecast { margin-top: 2rem; }
@@ -730,6 +779,10 @@ def index():
                 <h3>Feature values</h3>
                 <ul id="logreg-feature-list"></ul>
               </div>
+              <div class="logreg-sample-chart">
+                <h3>Model input and predicted candles</h3>
+                <div id="logreg-sample-chart"></div>
+              </div>
             </div>
             <div class="logreg-forecast">
               <div class="forecast-controls">
@@ -761,6 +814,7 @@ def index():
           const logregPrediction = document.getElementById('logreg-prediction');
           const logregProbability = document.getElementById('logreg-probability');
           const logregFeatureList = document.getElementById('logreg-feature-list');
+          const logregSampleChart = document.getElementById('logreg-sample-chart');
           const forecastRunButton = document.getElementById('forecast-run');
           const forecastStepsInput = document.getElementById('forecast-steps');
           const forecastStatus = document.getElementById('forecast-status');
@@ -851,20 +905,25 @@ def index():
             }
           }
 
-          async function runForecast(auto = false) {
-            if (!forecastStatus) return;
+          function getForecastMinutes() {
             const rawValue = forecastStepsInput ? Number(forecastStepsInput.value) : 15;
             const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
             if (forecastStepsInput) {
               forecastStepsInput.value = bounded;
             }
+            return bounded;
+          }
+
+          async function runForecast(auto = false) {
+            if (!forecastStatus) return;
+            const bounded = getForecastMinutes();
             const mode = forecastToggle && forecastToggle.checked ? 'latest' : 'random';
             forecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
             if (forecastRunButton) {
               forecastRunButton.disabled = true;
             }
             try {
-              const response = await fetch(`/api/logreg/forecast?steps=${bounded}&mode=${mode}`);
+              const response = await fetch(`/api/logreg/forecast?minutes=${bounded}&mode=${mode}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -886,7 +945,8 @@ def index():
           function renderForecast(data) {
             if (!forecastStatus) return;
             const forecast = Array.isArray(data.forecast) ? data.forecast : [];
-            const groundTruth = Array.isArray(data.ground_truth) ? data.ground_truth : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : Array.isArray(data.ground_truth) ? data.ground_truth : [];
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
             if (!forecast.length) {
               forecastStatus.textContent = 'Forecast unavailable.';
               if (window.Plotly) {
@@ -901,6 +961,9 @@ def index():
               statusParts.push(`Anchor candle: ${anchorDate.toLocaleString()}`);
             }
             statusParts.push(data.mode === 'latest' ? 'Mode: latest forecast' : 'Mode: historical evaluation');
+            if (typeof data.horizon_minutes === 'number') {
+              statusParts.push(`Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}`);
+            }
             if (groundTruth.length === forecast.length && groundTruth.length) {
               statusParts.push('Ground truth overlay available.');
             } else if (groundTruth.length) {
@@ -914,6 +977,23 @@ def index():
             }
             forecastStatus.textContent = statusParts.join(' · ');
 
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.5,
+              });
+            }
+
             const forecastTrace = {
               x: forecast.map(c => c.datetime),
               open: forecast.map(c => c.open),
@@ -926,11 +1006,10 @@ def index():
               decreasing: { line: { color: '#f59e0b' } },
               opacity: 0.65,
             };
-
-            const traces = [forecastTrace];
+            traces.push(forecastTrace);
 
             if (groundTruth.length) {
-              traces.unshift({
+              traces.push({
                 x: groundTruth.map(c => c.datetime),
                 open: groundTruth.map(c => c.open),
                 high: groundTruth.map(c => c.high),
@@ -967,7 +1046,8 @@ def index():
             logregStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
             logregCard.hidden = true;
             try {
-              const response = await fetch(`/api/logreg/sample?mode=${mode}`);
+              const minutes = getForecastMinutes();
+              const response = await fetch(`/api/logreg/sample?mode=${mode}&minutes=${minutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -976,6 +1056,9 @@ def index():
             } catch (error) {
               console.error(error);
               logregStatus.textContent = error.message || 'Logistic regression data unavailable.';
+              if (window.Plotly) {
+                Plotly.purge('logreg-sample-chart');
+              }
             }
           }
 
@@ -991,6 +1074,10 @@ def index():
               }
             } else {
               logregStatus.textContent = 'Latest candle prediction (ground truth may not yet exist).';
+            }
+
+            if (typeof data.horizon_minutes === 'number') {
+              logregStatus.textContent += ` Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}.`;
             }
 
             const ts = data.datetime;
@@ -1023,7 +1110,82 @@ def index():
               logregFeatureList.appendChild(li);
             });
 
+            renderLogregSampleChart(data);
             logregCard.hidden = false;
+          }
+
+          function renderLogregSampleChart(data) {
+            if (!logregSampleChart || !window.Plotly) {
+              return;
+            }
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
+            const forecast = Array.isArray(data.forecast_candles) ? data.forecast_candles : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : [];
+
+            if (!history.length && !forecast.length) {
+              Plotly.purge('logreg-sample-chart');
+              return;
+            }
+
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.55,
+              });
+            }
+
+            if (forecast.length) {
+              traces.push({
+                x: forecast.map(c => c.datetime),
+                open: forecast.map(c => c.open),
+                high: forecast.map(c => c.high),
+                low: forecast.map(c => c.low),
+                close: forecast.map(c => c.close),
+                type: 'candlestick',
+                name: 'Forecast',
+                increasing: { line: { color: '#38bdf8' } },
+                decreasing: { line: { color: '#f97316' } },
+                opacity: 0.75,
+              });
+            }
+
+            if (groundTruth.length) {
+              traces.push({
+                x: groundTruth.map(c => c.datetime),
+                open: groundTruth.map(c => c.open),
+                high: groundTruth.map(c => c.high),
+                low: groundTruth.map(c => c.low),
+                close: groundTruth.map(c => c.close),
+                type: 'candlestick',
+                name: 'Ground truth',
+                increasing: { line: { color: '#22c55e' } },
+                decreasing: { line: { color: '#ef4444' } },
+                opacity: 0.85,
+              });
+            }
+
+            const layout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 30, t: 30, b: 40 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+              xaxis: { rangeslider: { visible: false } },
+              yaxis: { fixedrange: false, title: 'Price (USDT)' },
+            };
+
+            Plotly.react('logreg-sample-chart', traces, layout, { responsive: true, displaylogo: false });
           }
 
           async function fetchAndRender() {
