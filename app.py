@@ -45,6 +45,8 @@ DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
 ANALYTICS_TEST_PATH = Path("data/ml/test.parquet")
 DEFAULT_ANALYTICS_INITIAL_CASH = 1000.0
 DEFAULT_ANALYTICS_BET_SIZE = 100.0
+DEFAULT_ANALYTICS_TRANSACTION_FEE = 0.0  # percent
+DEFAULT_ANALYTICS_BUY_CONFIDENCE = 0.0  # percent
 ANALYTICS_MAX_POINTS = 5000
 LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
 RF_MODEL_PATH = Path("models/artifacts/rf.pkl")
@@ -1087,6 +1089,8 @@ def _simulate_trades(
     mode: str,
     initial_cash: float,
     bet_size: float,
+    transaction_fee_pct: float,
+    buy_confidence_pct: float,
 ) -> Dict[str, object]:
     """Simulate trades over ``frame`` using the trade bot heuristics."""
 
@@ -1119,12 +1123,15 @@ def _simulate_trades(
     sell_markers: List[Dict[str, object]] = []
     equity_points: List[Dict[str, object]] = []
     exposure_minutes = 0.0
+    total_fees = 0.0
 
     mode_key = mode.lower()
     if mode_key not in {"cumulative", "fixed"}:
         raise ValueError(f"Unsupported analytics mode: {mode}")
 
     bet_size = max(0.0, float(bet_size))
+    fee_rate = max(0.0, float(transaction_fee_pct)) / 100.0
+    buy_confidence = max(0.0, float(buy_confidence_pct)) / 100.0
 
     timestamps = frame["timestamp"].to_numpy(dtype="int64")
 
@@ -1146,30 +1153,45 @@ def _simulate_trades(
         datetime_value = pd.to_datetime(row["datetime"]).isoformat()
 
         if current_trade is None:
-            if expected_return > 0 and probability >= 0.52 and cash > 0:
+            meets_confidence = expected_return > 0 and expected_return >= buy_confidence
+            if meets_confidence and probability >= 0.52 and cash > 0:
                 stake = cash if mode_key == "cumulative" else min(bet_size, cash)
                 if stake > 0:
-                    units = stake / price
-                    cash -= stake
-                    position_units = units
-                    current_trade = {
-                        "entry_timestamp": timestamp,
-                        "entry_datetime": datetime_value,
-                        "entry_price": price,
-                        "stake": stake,
-                        "units": units,
-                    }
-                    buy_markers.append(
-                        {"timestamp": timestamp, "datetime": datetime_value, "price": price}
-                    )
+                    max_affordable = cash / (1.0 + fee_rate) if fee_rate > 0 else cash
+                    if stake > max_affordable:
+                        stake = max_affordable
+                    if stake > 0:
+                        buy_fee = stake * fee_rate
+                        units = stake / price if price else 0.0
+                        total_cost = stake + buy_fee
+                        if units > 0 and total_cost <= cash + 1e-12:
+                            cash -= total_cost
+                            position_units = units
+                            current_trade = {
+                                "entry_timestamp": timestamp,
+                                "entry_datetime": datetime_value,
+                                "entry_price": price,
+                                "stake": stake,
+                                "units": units,
+                                "buy_fee": buy_fee,
+                            }
+                            total_fees += buy_fee
+                            buy_markers.append(
+                                {"timestamp": timestamp, "datetime": datetime_value, "price": price}
+                            )
         else:
             if expected_return < 0 and probability <= 0.48:
                 units = float(current_trade["units"])
                 proceeds = units * price
-                cash += proceeds
-                pnl = proceeds - float(current_trade["stake"])
+                sell_fee = proceeds * fee_rate
+                net_proceeds = proceeds - sell_fee
+                cash += net_proceeds
+                pnl = net_proceeds - (
+                    float(current_trade["stake"]) + float(current_trade.get("buy_fee", 0.0))
+                )
                 entry_price = float(current_trade["entry_price"])
-                return_pct = (price / entry_price) - 1.0 if entry_price else 0.0
+                cost_basis = float(current_trade["stake"]) + float(current_trade.get("buy_fee", 0.0))
+                return_pct = (pnl / cost_basis) if cost_basis else 0.0
                 duration_minutes = (timestamp - float(current_trade["entry_timestamp"])) / 60000.0
                 exposure_minutes += max(duration_minutes, 0.0)
                 trade = {
@@ -1180,6 +1202,8 @@ def _simulate_trades(
                     "pnl": pnl,
                     "return_pct": return_pct,
                     "duration_minutes": duration_minutes,
+                    "sell_fee": sell_fee,
+                    "total_fees": float(current_trade.get("buy_fee", 0.0)) + sell_fee,
                 }
                 trades.append(trade)
                 sell_markers.append(
@@ -1187,6 +1211,7 @@ def _simulate_trades(
                 )
                 position_units = 0.0
                 current_trade = None
+                total_fees += sell_fee
 
         equity = cash + position_units * price
         equity_points.append({"timestamp": timestamp, "datetime": datetime_value, "equity": equity})
@@ -1198,10 +1223,15 @@ def _simulate_trades(
         datetime_value = pd.to_datetime(last_row["datetime"]).isoformat()
         units = float(current_trade["units"])
         proceeds = units * price
-        cash += proceeds
-        pnl = proceeds - float(current_trade["stake"])
+        sell_fee = proceeds * fee_rate
+        net_proceeds = proceeds - sell_fee
+        cash += net_proceeds
+        pnl = net_proceeds - (
+            float(current_trade["stake"]) + float(current_trade.get("buy_fee", 0.0))
+        )
         entry_price = float(current_trade["entry_price"])
-        return_pct = (price / entry_price) - 1.0 if entry_price else 0.0
+        cost_basis = float(current_trade["stake"]) + float(current_trade.get("buy_fee", 0.0))
+        return_pct = (pnl / cost_basis) if cost_basis else 0.0
         duration_minutes = (timestamp - float(current_trade["entry_timestamp"])) / 60000.0
         exposure_minutes += max(duration_minutes, 0.0)
         trade = {
@@ -1212,11 +1242,14 @@ def _simulate_trades(
             "pnl": pnl,
             "return_pct": return_pct,
             "duration_minutes": duration_minutes,
+            "sell_fee": sell_fee,
+            "total_fees": float(current_trade.get("buy_fee", 0.0)) + sell_fee,
         }
         trades.append(trade)
         sell_markers.append({"timestamp": timestamp, "datetime": datetime_value, "price": price})
         equity_points[-1]["equity"] = cash
         position_units = 0.0
+        total_fees += sell_fee
 
     equity_values = np.array([point["equity"] for point in equity_points], dtype=float)
     if equity_values.size:
@@ -1256,6 +1289,7 @@ def _simulate_trades(
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "exposure_ratio": exposure_ratio,
+        "total_fees": total_fees,
     }
 
     return {
@@ -1926,6 +1960,18 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         bet_size = float(request.args.get("bet_size", DEFAULT_ANALYTICS_BET_SIZE))
     except ValueError:
         bet_size = DEFAULT_ANALYTICS_BET_SIZE
+    try:
+        transaction_fee = float(
+            request.args.get("transaction_fee", DEFAULT_ANALYTICS_TRANSACTION_FEE)
+        )
+    except ValueError:
+        transaction_fee = DEFAULT_ANALYTICS_TRANSACTION_FEE
+    try:
+        buy_confidence = float(
+            request.args.get("buy_confidence", DEFAULT_ANALYTICS_BUY_CONFIDENCE)
+        )
+    except ValueError:
+        buy_confidence = DEFAULT_ANALYTICS_BUY_CONFIDENCE
 
     try:
         dataset = _load_analytics_dataset()
@@ -1948,7 +1994,14 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         return jsonify({"error": "Not enough data to run the simulation."}), 503
 
     try:
-        simulation = _simulate_trades(frame, mode, initial_cash, bet_size)
+        simulation = _simulate_trades(
+            frame,
+            mode,
+            initial_cash,
+            bet_size,
+            transaction_fee,
+            buy_confidence,
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1997,6 +2050,8 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         "mode": mode,
         "initial_cash": float(initial_cash),
         "bet_size": float(bet_size),
+        "transaction_fee": float(transaction_fee),
+        "buy_confidence": float(buy_confidence),
         "stats": simulation.get("stats", {}),
         "trades": trades_payload,
         "price_series": price_series,
@@ -2195,6 +2250,14 @@ def index():
               <div class="analytics-control" id="analytics-bet-size-group" hidden>
                 <label for="analytics-bet-size">Fixed bet size (USDT)</label>
                 <input type="number" id="analytics-bet-size" min="0" step="10" value="100">
+              </div>
+              <div class="analytics-control">
+                <label for="analytics-transaction-fee">Transaction fee (%)</label>
+                <input type="number" id="analytics-transaction-fee" min="0" step="0.01" value="0">
+              </div>
+              <div class="analytics-control">
+                <label for="analytics-buy-confidence">Buy confidence threshold (%)</label>
+                <input type="number" id="analytics-buy-confidence" min="0" step="0.01" value="0">
               </div>
               <button id="analytics-run">Run simulation</button>
             </div>
@@ -2677,6 +2740,8 @@ def index():
           const analyticsInitialCashInput = document.getElementById('analytics-initial-cash');
           const analyticsBetSizeGroup = document.getElementById('analytics-bet-size-group');
           const analyticsBetSizeInput = document.getElementById('analytics-bet-size');
+          const analyticsTransactionFeeInput = document.getElementById('analytics-transaction-fee');
+          const analyticsBuyConfidenceInput = document.getElementById('analytics-buy-confidence');
           const analyticsModeRadios = document.querySelectorAll('input[name="analytics-mode"]');
           const analyticsRunButton = document.getElementById('analytics-run');
           const analyticsStatus = document.getElementById('analytics-status');
@@ -3226,6 +3291,14 @@ def index():
               if (Number.isFinite(betSizeValue) && betSizeValue >= 0) {
                 params.set('bet_size', String(betSizeValue));
               }
+            }
+            const transactionFeeValue = analyticsTransactionFeeInput ? Number(analyticsTransactionFeeInput.value) : 0;
+            if (Number.isFinite(transactionFeeValue) && transactionFeeValue >= 0) {
+              params.set('transaction_fee', String(transactionFeeValue));
+            }
+            const buyConfidenceValue = analyticsBuyConfidenceInput ? Number(analyticsBuyConfidenceInput.value) : 0;
+            if (Number.isFinite(buyConfidenceValue) && buyConfidenceValue >= 0) {
+              params.set('buy_confidence', String(buyConfidenceValue));
             }
 
             analyticsStatus.textContent = 'Running simulation…';
