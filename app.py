@@ -15,6 +15,7 @@ import requests
 from flask import Flask, jsonify, render_template_string, request
 from sklearn.pipeline import Pipeline
 
+from mlops.data_loader import load_parquet
 from mlops.features import make_basic_features, make_label
 from mlops.split import time_train_test_split
 from models.logistic_regression import (
@@ -41,6 +42,10 @@ from trade_bot import generate_trade_report, serialise_trade_report
 
 APP_UPDATE_INTERVAL = 60  # seconds
 DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
+ANALYTICS_TEST_PATH = Path("data/ml/test.parquet")
+DEFAULT_ANALYTICS_INITIAL_CASH = 1000.0
+DEFAULT_ANALYTICS_BET_SIZE = 100.0
+ANALYTICS_MAX_POINTS = 5000
 LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
 RF_MODEL_PATH = Path("models/artifacts/rf.pkl")
 XGB_MODEL_PATH = Path("models/artifacts/xgb.pkl")
@@ -714,6 +719,20 @@ def _ensure_dataset_dir() -> None:
         DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _load_analytics_dataset() -> pd.DataFrame:
+    """Load the hold-out test dataset used for analytics simulations."""
+
+    if not ANALYTICS_TEST_PATH.exists():
+        raise FileNotFoundError(
+            "Test dataset not found. Run split_dataset.py to generate data/ml/test.parquet"
+        )
+    try:
+        df = load_parquet(ANALYTICS_TEST_PATH)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        raise RuntimeError(f"Failed to load analytics dataset: {exc}") from exc
+    return df
+
+
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure the dataframe uses the canonical schema."""
     rename_map = {}
@@ -964,6 +983,322 @@ def _serialise_forecast(rows: Iterable[Dict[str, object]]) -> List[Dict[str, obj
             }
         )
     return serialised
+
+
+def _analytics_probability_series(df: pd.DataFrame, model_name: str) -> pd.Series:
+    """Compute model probabilities for each candle in ``df``."""
+
+    features = make_basic_features(df)
+    if features.empty:
+        return pd.Series(dtype="float64")
+
+    model_key = model_name.lower()
+    order_map = {
+        "logreg": LOGREG_FEATURE_ORDER,
+        "rf": RF_FEATURE_ORDER,
+        "xgb": XGB_FEATURE_ORDER,
+        "lstm": LSTM_FEATURE_ORDER,
+    }
+    if model_key not in order_map:
+        raise ValueError(f"Unsupported model for analytics: {model_name}")
+
+    order = list(order_map[model_key])
+    feature_view = features.loc[:, order].dropna()
+    if feature_view.empty:
+        return pd.Series(dtype="float64")
+
+    if model_key == "logreg":
+        _ensure_logreg_model_loaded()
+        if logreg_model is None:
+            raise RuntimeError("Logistic regression model is unavailable.")
+        proba = logreg_model.predict_proba(feature_view)
+        values = proba[:, 1] if isinstance(proba, np.ndarray) else np.asarray(proba, dtype=float)
+        return pd.Series(values.astype(float), index=feature_view.index)
+
+    if model_key == "rf":
+        _ensure_rf_model_loaded()
+        if rf_model is None:
+            raise RuntimeError("Random forest model is unavailable.")
+        proba = rf_model.predict_proba(feature_view)
+        values = proba[:, 1] if isinstance(proba, np.ndarray) else np.asarray(proba, dtype=float)
+        return pd.Series(values.astype(float), index=feature_view.index)
+
+    if model_key == "xgb":
+        _ensure_xgb_model_loaded()
+        if xgb_model is None:
+            raise RuntimeError("XGBoost model is unavailable.")
+        proba = xgb_model.predict_proba(feature_view)
+        values = proba[:, 1] if isinstance(proba, np.ndarray) else np.asarray(proba, dtype=float)
+        return pd.Series(values.astype(float), index=feature_view.index)
+
+    _ensure_lstm_model_loaded()
+    if lstm_model is None:
+        raise RuntimeError("LSTM model is unavailable.")
+    probabilities = predict_lstm_proba(lstm_model, feature_view)
+    if probabilities.empty:
+        return probabilities.astype(float)
+    return probabilities.astype(float)
+
+
+def _build_analytics_frame(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
+    """Prepare the dataframe used for analytics backtesting."""
+
+    probabilities = _analytics_probability_series(df, model_name)
+    if probabilities.empty:
+        return pd.DataFrame(columns=["timestamp", "datetime", "close", "probability", "expected_return"])
+
+    ordered = df.sort_values("timestamp")
+    returns = ordered["close"].pct_change()
+    positive = returns.where(returns > 0)
+    negative = returns.where(returns < 0)
+    pos_sum = positive.fillna(0.0).cumsum()
+    pos_count = positive.notna().cumsum().replace(0, np.nan)
+    neg_sum = negative.fillna(0.0).cumsum()
+    neg_count = negative.notna().cumsum().replace(0, np.nan)
+    pos_mean = (pos_sum / pos_count).fillna(0.0)
+    neg_mean = (neg_sum / neg_count).fillna(0.0)
+
+    frame = ordered.loc[probabilities.index, ["timestamp", "datetime", "close"]].copy()
+    frame["probability"] = probabilities.loc[frame.index].astype(float)
+    frame["positive_mean"] = pos_mean.loc[frame.index].astype(float)
+    frame["negative_mean"] = neg_mean.loc[frame.index].astype(float)
+    frame["expected_return"] = (
+        frame["probability"] * frame["positive_mean"]
+        + (1.0 - frame["probability"]) * frame["negative_mean"]
+    )
+    return frame
+
+
+def _sample_points(sequence: List[Dict[str, object]], max_points: int) -> List[Dict[str, object]]:
+    if not sequence:
+        return []
+    if len(sequence) <= max_points:
+        return list(sequence)
+    step = max(1, len(sequence) // max_points)
+    sampled = sequence[::step]
+    if sampled[-1] is not sequence[-1]:
+        if sampled[-1].get("timestamp") != sequence[-1].get("timestamp"):
+            sampled.append(sequence[-1])
+    return sampled
+
+
+def _simulate_trades(
+    frame: pd.DataFrame,
+    mode: str,
+    initial_cash: float,
+    bet_size: float,
+) -> Dict[str, object]:
+    """Simulate trades over ``frame`` using the trade bot heuristics."""
+
+    if frame.empty:
+        return {
+            "equity_curve": [],
+            "trades": [],
+            "buys": [],
+            "sells": [],
+            "stats": {
+                "trades": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "return_pct": 0.0,
+                "final_equity": float(initial_cash),
+                "max_drawdown": 0.0,
+                "avg_trade_return": 0.0,
+                "avg_trade_duration_minutes": 0.0,
+                "best_trade": 0.0,
+                "worst_trade": 0.0,
+                "exposure_ratio": 0.0,
+            },
+        }
+
+    cash = float(initial_cash)
+    position_units = 0.0
+    current_trade: Dict[str, float] | None = None
+    trades: List[Dict[str, object]] = []
+    buy_markers: List[Dict[str, object]] = []
+    sell_markers: List[Dict[str, object]] = []
+    equity_points: List[Dict[str, object]] = []
+    exposure_minutes = 0.0
+
+    mode_key = mode.lower()
+    if mode_key not in {"cumulative", "fixed"}:
+        raise ValueError(f"Unsupported analytics mode: {mode}")
+
+    bet_size = max(0.0, float(bet_size))
+
+    timestamps = frame["timestamp"].to_numpy(dtype="int64")
+
+    for idx, row in frame.iterrows():
+        price = float(row["close"])
+        if price <= 0:
+            equity_points.append(
+                {
+                    "timestamp": int(row["timestamp"]),
+                    "datetime": pd.to_datetime(row["datetime"]).isoformat(),
+                    "equity": cash + position_units * price,
+                }
+            )
+            continue
+
+        probability = float(row["probability"])
+        expected_return = float(row["expected_return"])
+        timestamp = int(row["timestamp"])
+        datetime_value = pd.to_datetime(row["datetime"]).isoformat()
+
+        if current_trade is None:
+            if expected_return > 0 and probability >= 0.52 and cash > 0:
+                stake = cash if mode_key == "cumulative" else min(bet_size, cash)
+                if stake > 0:
+                    units = stake / price
+                    cash -= stake
+                    position_units = units
+                    current_trade = {
+                        "entry_timestamp": timestamp,
+                        "entry_datetime": datetime_value,
+                        "entry_price": price,
+                        "stake": stake,
+                        "units": units,
+                    }
+                    buy_markers.append(
+                        {"timestamp": timestamp, "datetime": datetime_value, "price": price}
+                    )
+        else:
+            if expected_return < 0 and probability <= 0.48:
+                units = float(current_trade["units"])
+                proceeds = units * price
+                cash += proceeds
+                pnl = proceeds - float(current_trade["stake"])
+                entry_price = float(current_trade["entry_price"])
+                return_pct = (price / entry_price) - 1.0 if entry_price else 0.0
+                duration_minutes = (timestamp - float(current_trade["entry_timestamp"])) / 60000.0
+                exposure_minutes += max(duration_minutes, 0.0)
+                trade = {
+                    **current_trade,
+                    "exit_timestamp": timestamp,
+                    "exit_datetime": datetime_value,
+                    "exit_price": price,
+                    "pnl": pnl,
+                    "return_pct": return_pct,
+                    "duration_minutes": duration_minutes,
+                }
+                trades.append(trade)
+                sell_markers.append(
+                    {"timestamp": timestamp, "datetime": datetime_value, "price": price}
+                )
+                position_units = 0.0
+                current_trade = None
+
+        equity = cash + position_units * price
+        equity_points.append({"timestamp": timestamp, "datetime": datetime_value, "equity": equity})
+
+    if current_trade is not None and not frame.empty:
+        last_row = frame.iloc[-1]
+        price = float(last_row["close"])
+        timestamp = int(last_row["timestamp"])
+        datetime_value = pd.to_datetime(last_row["datetime"]).isoformat()
+        units = float(current_trade["units"])
+        proceeds = units * price
+        cash += proceeds
+        pnl = proceeds - float(current_trade["stake"])
+        entry_price = float(current_trade["entry_price"])
+        return_pct = (price / entry_price) - 1.0 if entry_price else 0.0
+        duration_minutes = (timestamp - float(current_trade["entry_timestamp"])) / 60000.0
+        exposure_minutes += max(duration_minutes, 0.0)
+        trade = {
+            **current_trade,
+            "exit_timestamp": timestamp,
+            "exit_datetime": datetime_value,
+            "exit_price": price,
+            "pnl": pnl,
+            "return_pct": return_pct,
+            "duration_minutes": duration_minutes,
+        }
+        trades.append(trade)
+        sell_markers.append({"timestamp": timestamp, "datetime": datetime_value, "price": price})
+        equity_points[-1]["equity"] = cash
+        position_units = 0.0
+
+    equity_values = np.array([point["equity"] for point in equity_points], dtype=float)
+    if equity_values.size:
+        running_max = np.maximum.accumulate(equity_values)
+        drawdowns = np.where(running_max > 0, equity_values / running_max - 1.0, 0.0)
+        max_drawdown = float(drawdowns.min()) if drawdowns.size else 0.0
+    else:
+        max_drawdown = 0.0
+
+    final_equity = float(equity_values[-1]) if equity_values.size else float(initial_cash)
+    total_pnl = final_equity - float(initial_cash)
+    return_pct = (final_equity / float(initial_cash) - 1.0) if initial_cash else 0.0
+    trade_returns = [float(trade["return_pct"]) for trade in trades]
+    avg_trade_return = float(np.mean(trade_returns)) if trade_returns else 0.0
+    avg_duration = (
+        float(np.mean([trade["duration_minutes"] for trade in trades])) if trades else 0.0
+    )
+    best_trade = max(trade_returns) if trade_returns else 0.0
+    worst_trade = min(trade_returns) if trade_returns else 0.0
+    wins = sum(1 for trade in trades if float(trade["pnl"]) > 0)
+    win_rate = wins / len(trades) if trades else 0.0
+
+    total_minutes = (
+        (timestamps[-1] - timestamps[0]) / 60000.0 if len(timestamps) > 1 else 0.0
+    )
+    exposure_ratio = (exposure_minutes / total_minutes) if total_minutes > 0 else 0.0
+
+    stats = {
+        "trades": len(trades),
+        "win_rate": win_rate,
+        "total_pnl": total_pnl,
+        "return_pct": return_pct,
+        "final_equity": final_equity,
+        "max_drawdown": abs(max_drawdown),
+        "avg_trade_return": avg_trade_return,
+        "avg_trade_duration_minutes": avg_duration,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "exposure_ratio": exposure_ratio,
+    }
+
+    return {
+        "equity_curve": equity_points,
+        "trades": trades,
+        "buys": buy_markers,
+        "sells": sell_markers,
+        "stats": stats,
+    }
+
+
+def _serialise_price_series(frame: pd.DataFrame, max_points: int) -> List[Dict[str, object]]:
+    if frame.empty:
+        return []
+    ordered = frame.sort_values("timestamp")
+    step = max(1, len(ordered) // max_points)
+    subset = ordered.iloc[::step]
+    if subset.iloc[-1]["timestamp"] != ordered.iloc[-1]["timestamp"]:
+        subset = pd.concat([subset, ordered.iloc[[-1]]]).drop_duplicates("timestamp", keep="last")
+    serialised: List[Dict[str, object]] = []
+    for _, row in subset.iterrows():
+        serialised.append(
+            {
+                "timestamp": int(row["timestamp"]),
+                "datetime": pd.to_datetime(row["datetime"]).isoformat(),
+                "price": float(row["close"]),
+            }
+        )
+    return serialised
+
+
+def _serialise_equity_curve(points: List[Dict[str, object]], max_points: int) -> List[Dict[str, object]]:
+    if not points:
+        return []
+    sampled = _sample_points(points, max_points)
+    return [
+        {
+            "timestamp": int(point["timestamp"]),
+            "datetime": pd.to_datetime(point["datetime"]).isoformat(),
+            "equity": float(point["equity"]),
+        }
+        for point in sampled
+    ]
 
 
 @app.route("/api/candles")
@@ -1579,6 +1914,101 @@ def api_rf_forecast():
     )
 
 
+@app.route("/api/analytics/simulation")
+def api_analytics_simulation() -> Tuple[Any, int] | Any:
+    model = request.args.get("model", "logreg").lower()
+    mode = request.args.get("mode", "cumulative").lower()
+    try:
+        initial_cash = float(request.args.get("initial_cash", DEFAULT_ANALYTICS_INITIAL_CASH))
+    except ValueError:
+        initial_cash = DEFAULT_ANALYTICS_INITIAL_CASH
+    try:
+        bet_size = float(request.args.get("bet_size", DEFAULT_ANALYTICS_BET_SIZE))
+    except ValueError:
+        bet_size = DEFAULT_ANALYTICS_BET_SIZE
+
+    try:
+        dataset = _load_analytics_dataset()
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if dataset.empty:
+        return jsonify({"error": "Test dataset is empty."}), 503
+
+    try:
+        frame = _build_analytics_frame(dataset, model)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    if frame.empty:
+        return jsonify({"error": "Not enough data to run the simulation."}), 503
+
+    try:
+        simulation = _simulate_trades(frame, mode, initial_cash, bet_size)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    price_series = _serialise_price_series(frame, ANALYTICS_MAX_POINTS)
+    equity_curve = _serialise_equity_curve(
+        simulation.get("equity_curve", []), ANALYTICS_MAX_POINTS
+    )
+
+    trades_payload = []
+    for trade in simulation.get("trades", []):
+        trades_payload.append(
+            {
+                "entry_timestamp": int(trade["entry_timestamp"]),
+                "entry_datetime": trade["entry_datetime"],
+                "entry_price": float(trade["entry_price"]),
+                "exit_timestamp": int(trade.get("exit_timestamp", trade["entry_timestamp"])),
+                "exit_datetime": trade.get("exit_datetime", trade["entry_datetime"]),
+                "exit_price": float(trade.get("exit_price", trade["entry_price"])),
+                "pnl": float(trade.get("pnl", 0.0)),
+                "return_pct": float(trade.get("return_pct", 0.0)),
+                "duration_minutes": float(trade.get("duration_minutes", 0.0)),
+                "stake": float(trade.get("stake", 0.0)),
+                "units": float(trade.get("units", 0.0)),
+            }
+        )
+
+    buy_markers = [
+        {
+            "timestamp": int(marker["timestamp"]),
+            "datetime": marker["datetime"],
+            "price": float(marker["price"]),
+        }
+        for marker in simulation.get("buys", [])
+    ]
+    sell_markers = [
+        {
+            "timestamp": int(marker["timestamp"]),
+            "datetime": marker["datetime"],
+            "price": float(marker["price"]),
+        }
+        for marker in simulation.get("sells", [])
+    ]
+
+    response = {
+        "model": model,
+        "mode": mode,
+        "initial_cash": float(initial_cash),
+        "bet_size": float(bet_size),
+        "stats": simulation.get("stats", {}),
+        "trades": trades_payload,
+        "price_series": price_series,
+        "equity_curve": equity_curve,
+        "signals": {"buys": buy_markers, "sells": sell_markers},
+        "data_points": int(len(frame)),
+        "sampled_points": int(len(price_series)),
+    }
+
+    return jsonify(response)
+
+
 @app.route("/")
 def index():
     template = """
@@ -1610,6 +2040,28 @@ def index():
           .status { margin-top: 0.75rem; font-size: 0.9rem; color: #cbd5f5; }
           .tab-content { display: none; }
           .tab-content.active { display: block; }
+          .analytics-controls { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-end; }
+          .analytics-control { display: flex; flex-direction: column; gap: 0.35rem; min-width: 160px; }
+          .analytics-control label { font-size: 0.85rem; color: #cbd5f5; }
+          .analytics-control-title { font-size: 0.85rem; color: #cbd5f5; margin-bottom: 0.35rem; display: block; }
+          .analytics-control input, .analytics-control select { background: #0f172a; color: #e2e8f0; border: 1px solid rgba(148,163,184,0.4); border-radius: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.95rem; }
+          .analytics-mode-group { display: flex; gap: 1rem; align-items: center; }
+          .analytics-mode-group label { display: flex; align-items: center; gap: 0.35rem; font-size: 0.9rem; cursor: pointer; }
+          .analytics-status { margin-bottom: 1.5rem; color: #cbd5f5; font-size: 0.95rem; }
+          .analytics-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+          .analytics-card { background: #1e293b; border: 1px solid rgba(148,163,184,0.25); border-radius: 0.75rem; padding: 1rem; }
+          .analytics-card h3 { margin: 0 0 0.35rem 0; font-size: 0.95rem; color: #bfdbfe; }
+          .analytics-card p { margin: 0; font-size: 1.15rem; font-weight: 600; color: #f8fafc; }
+          .analytics-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; margin-bottom: 1.5rem; }
+          .analytics-chart { background: #0f172a; border: 1px solid rgba(148,163,184,0.25); border-radius: 0.75rem; padding: 0.75rem; }
+          .analytics-chart h3 { margin: 0 0 0.5rem 0; font-size: 1rem; color: #bfdbfe; }
+          .analytics-table-wrapper { overflow-x: auto; border: 1px solid rgba(148,163,184,0.25); border-radius: 0.75rem; }
+          table.analytics-table { width: 100%; border-collapse: collapse; min-width: 640px; }
+          table.analytics-table thead { background: rgba(15, 23, 42, 0.75); }
+          table.analytics-table th, table.analytics-table td { padding: 0.65rem 0.85rem; text-align: left; border-bottom: 1px solid rgba(148,163,184,0.2); font-size: 0.9rem; }
+          table.analytics-table tbody tr:nth-child(even) { background: rgba(30, 41, 59, 0.4); }
+          table.analytics-table tbody tr:hover { background: rgba(59, 130, 246, 0.15); }
+          .analytics-empty { padding: 1rem; text-align: center; color: #94a3b8; }
           .logreg-controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
           .logreg-card { background: #111827; border-radius: 1rem; padding: 1.5rem; border: 1px solid rgba(148,163,184,0.2); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.35); }
           .logreg-card h2 { margin-top: 0; margin-bottom: 0.5rem; font-size: 1.3rem; }
@@ -1705,6 +2157,7 @@ def index():
             <button class="tab-button" data-tab="xgb">XGBoost</button>
             <button class="tab-button" data-tab="lstm">LSTM</button>
             <button class="tab-button" data-tab="rf">Random forest</button>
+            <button class="tab-button" data-tab="analytics">Analytics</button>
           </div>
           <section id="candles-tab" class="tab-content active">
             <div class="controls">
@@ -1716,6 +2169,87 @@ def index():
             </div>
             <div id="chart"></div>
             <div class="status" id="status">Loading...</div>
+          </section>
+          <section id="analytics-tab" class="tab-content">
+            <div class="analytics-controls">
+              <div class="analytics-control">
+                <label for="analytics-model">Model</label>
+                <select id="analytics-model">
+                  <option value="logreg">Logistic regression</option>
+                  <option value="rf">Random forest</option>
+                  <option value="xgb">XGBoost</option>
+                  <option value="lstm">LSTM</option>
+                </select>
+              </div>
+              <div class="analytics-control">
+                <label for="analytics-initial-cash">Initial capital (USDT)</label>
+                <input type="number" id="analytics-initial-cash" min="1" step="10" value="1000">
+              </div>
+              <div class="analytics-control">
+                <span class="analytics-control-title">Simulation mode</span>
+                <div class="analytics-mode-group">
+                  <label><input type="radio" name="analytics-mode" value="cumulative" checked> Cumulative</label>
+                  <label><input type="radio" name="analytics-mode" value="fixed"> Fixed bet</label>
+                </div>
+              </div>
+              <div class="analytics-control" id="analytics-bet-size-group" hidden>
+                <label for="analytics-bet-size">Fixed bet size (USDT)</label>
+                <input type="number" id="analytics-bet-size" min="0" step="10" value="100">
+              </div>
+              <button id="analytics-run">Run simulation</button>
+            </div>
+            <div id="analytics-status" class="analytics-status">
+              Select a model and run the simulation to evaluate trade bot performance on the test dataset.
+            </div>
+            <div class="analytics-stats">
+              <div class="analytics-card">
+                <h3>Total trades</h3>
+                <p id="analytics-stat-trades">0</p>
+              </div>
+              <div class="analytics-card">
+                <h3>Win rate</h3>
+                <p id="analytics-stat-winrate">0%</p>
+              </div>
+              <div class="analytics-card">
+                <h3>Total P/L</h3>
+                <p id="analytics-stat-pnl">0 USDT</p>
+              </div>
+              <div class="analytics-card">
+                <h3>Return</h3>
+                <p id="analytics-stat-return">0%</p>
+              </div>
+              <div class="analytics-card">
+                <h3>Max drawdown</h3>
+                <p id="analytics-stat-drawdown">0%</p>
+              </div>
+            </div>
+            <div class="analytics-charts">
+              <div class="analytics-chart">
+                <h3>Price with trade signals</h3>
+                <div id="analytics-price-chart"></div>
+              </div>
+              <div class="analytics-chart">
+                <h3>Portfolio value</h3>
+                <div id="analytics-equity-chart"></div>
+              </div>
+            </div>
+            <div class="analytics-table-wrapper">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th>Entry time</th>
+                    <th>Exit time</th>
+                    <th>Stake (USDT)</th>
+                    <th>P/L (USDT)</th>
+                    <th>Return %</th>
+                    <th>Duration (min)</th>
+                  </tr>
+                </thead>
+                <tbody id="analytics-trades-body">
+                  <tr><td colspan="6" class="analytics-empty">Run the simulation to list trades.</td></tr>
+                </tbody>
+              </table>
+            </div>
           </section>
           <section id="logreg-tab" class="tab-content">
             <div class="logreg-controls">
@@ -2139,11 +2673,29 @@ def index():
           const rfForecastStatus = document.getElementById('rf-forecast-status');
           const rfForecastToggle = document.getElementById('rf-forecast-latest-toggle');
           const rfForecastChart = document.getElementById('rf-forecast-chart');
+          const analyticsModelSelect = document.getElementById('analytics-model');
+          const analyticsInitialCashInput = document.getElementById('analytics-initial-cash');
+          const analyticsBetSizeGroup = document.getElementById('analytics-bet-size-group');
+          const analyticsBetSizeInput = document.getElementById('analytics-bet-size');
+          const analyticsModeRadios = document.querySelectorAll('input[name="analytics-mode"]');
+          const analyticsRunButton = document.getElementById('analytics-run');
+          const analyticsStatus = document.getElementById('analytics-status');
+          const analyticsPriceChart = document.getElementById('analytics-price-chart');
+          const analyticsEquityChart = document.getElementById('analytics-equity-chart');
+          const analyticsTradesBody = document.getElementById('analytics-trades-body');
+          const analyticsStats = {
+            trades: document.getElementById('analytics-stat-trades'),
+            winRate: document.getElementById('analytics-stat-winrate'),
+            pnl: document.getElementById('analytics-stat-pnl'),
+            returnPct: document.getElementById('analytics-stat-return'),
+            drawdown: document.getElementById('analytics-stat-drawdown'),
+          };
           let currentInterval = '1m';
           let logregHasLoaded = false;
           let xgbHasLoaded = false;
           let lstmHasLoaded = false;
           let rfHasLoaded = false;
+          let analyticsHasLoaded = false;
 
           tabButtons.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -2163,16 +2715,20 @@ def index():
               } else if (target === 'lstm' && !lstmHasLoaded) {
                 updateLstmControls();
                 loadLstmSample();
-                runLstmForecast(true);
-                lstmHasLoaded = true;
-              } else if (target === 'rf' && !rfHasLoaded) {
-                updateRfControls();
-                loadRfSample();
-                runRfForecast(true);
-                rfHasLoaded = true;
-              }
-            });
+              runLstmForecast(true);
+              lstmHasLoaded = true;
+            } else if (target === 'rf' && !rfHasLoaded) {
+              updateRfControls();
+              loadRfSample();
+              runRfForecast(true);
+              rfHasLoaded = true;
+            } else if (target === 'analytics' && !analyticsHasLoaded) {
+              updateAnalyticsControls();
+              runAnalyticsSimulation(true);
+              analyticsHasLoaded = true;
+            }
           });
+        });
 
           intervalButtons.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -2353,6 +2909,18 @@ def index():
             });
           }
 
+          if (analyticsRunButton) {
+            analyticsRunButton.addEventListener('click', () => {
+              runAnalyticsSimulation();
+            });
+          }
+
+          analyticsModeRadios.forEach(radio => {
+            radio.addEventListener('change', () => {
+              updateAnalyticsControls();
+            });
+          });
+
           if (rfForecastStepsInput) {
             rfForecastStepsInput.addEventListener('keydown', event => {
               if (event.key === 'Enter') {
@@ -2478,6 +3046,215 @@ def index():
                   li.textContent = `${action} @ ${when} · Price ${priceText} · Prob ${probText} · ${expectedText}`;
                   orders.appendChild(li);
                 });
+              }
+            }
+          }
+
+          function getAnalyticsMode() {
+            const radios = Array.from(analyticsModeRadios || []);
+            const selected = radios.find(radio => radio.checked);
+            return selected ? selected.value : 'cumulative';
+          }
+
+          function updateAnalyticsControls() {
+            const mode = getAnalyticsMode();
+            if (analyticsBetSizeGroup) {
+              analyticsBetSizeGroup.hidden = mode !== 'fixed';
+            }
+          }
+
+          function renderAnalytics(data) {
+            if (!analyticsStatus) return;
+            const stats = data && typeof data === 'object' ? data.stats || {} : {};
+            const rawModel = data && data.model ? String(data.model) : '';
+            const modelMap = {
+              logreg: 'Logistic regression',
+              rf: 'Random forest',
+              xgb: 'XGBoost',
+              lstm: 'LSTM',
+            };
+            const modelLabel = rawModel ? (modelMap[rawModel.toLowerCase()] || rawModel.toUpperCase()) : 'Analytics';
+            const finalEquity = formatUsd(stats.final_equity || 0, { withSign: false });
+            const totalPoints = Number(data && data.data_points ? data.data_points : 0);
+            const scopeText = totalPoints ? `${totalPoints.toLocaleString()} minutes` : 'test dataset';
+            analyticsStatus.textContent = `Simulation complete (${modelLabel}). Final equity ${finalEquity} across ${scopeText}.`;
+
+            if (analyticsStats.trades) {
+              const tradesValue = Number(stats.trades || 0);
+              analyticsStats.trades.textContent = tradesValue.toLocaleString();
+            }
+            if (analyticsStats.winRate) {
+              analyticsStats.winRate.textContent = formatPercent(stats.win_rate || 0);
+            }
+            if (analyticsStats.pnl) {
+              analyticsStats.pnl.textContent = formatUsd(stats.total_pnl || 0);
+            }
+            if (analyticsStats.returnPct) {
+              analyticsStats.returnPct.textContent = formatPercent(stats.return_pct || 0);
+            }
+            if (analyticsStats.drawdown) {
+              const drawdownValue = Number(stats.max_drawdown || 0);
+              analyticsStats.drawdown.textContent = drawdownValue
+                ? `-${(drawdownValue * 100).toFixed(1)}%`
+                : '0%';
+            }
+
+            const priceSeries = Array.isArray(data && data.price_series) ? data.price_series : [];
+            const buySignals = data && data.signals && Array.isArray(data.signals.buys) ? data.signals.buys : [];
+            const sellSignals = data && data.signals && Array.isArray(data.signals.sells) ? data.signals.sells : [];
+
+            const priceTraces = [];
+            if (priceSeries.length) {
+              priceTraces.push({
+                x: priceSeries.map(point => point.datetime),
+                y: priceSeries.map(point => Number(point.price)),
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Close price',
+                line: { color: '#38bdf8', width: 1.5 },
+              });
+            }
+            if (buySignals.length) {
+              priceTraces.push({
+                x: buySignals.map(point => point.datetime),
+                y: buySignals.map(point => Number(point.price)),
+                mode: 'markers',
+                name: 'Buy',
+                marker: { color: '#22c55e', size: 7, symbol: 'triangle-up' },
+              });
+            }
+            if (sellSignals.length) {
+              priceTraces.push({
+                x: sellSignals.map(point => point.datetime),
+                y: sellSignals.map(point => Number(point.price)),
+                mode: 'markers',
+                name: 'Sell',
+                marker: { color: '#ef4444', size: 7, symbol: 'triangle-down' },
+              });
+            }
+            const priceLayout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 20, t: 30, b: 50 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+            };
+            if (analyticsPriceChart && window.Plotly) {
+              Plotly.react('analytics-price-chart', priceTraces, priceLayout, { responsive: true, displaylogo: false });
+            }
+
+            const equityCurve = Array.isArray(data && data.equity_curve) ? data.equity_curve : [];
+            const equityTrace = {
+              x: equityCurve.map(point => point.datetime),
+              y: equityCurve.map(point => Number(point.equity)),
+              type: 'scatter',
+              mode: 'lines',
+              name: 'Equity',
+              line: { color: '#f97316', width: 1.5 },
+            };
+            const equityLayout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 20, t: 30, b: 50 },
+              showlegend: false,
+            };
+            if (analyticsEquityChart && window.Plotly) {
+              Plotly.react('analytics-equity-chart', [equityTrace], equityLayout, { responsive: true, displaylogo: false });
+            }
+
+            if (analyticsTradesBody) {
+              analyticsTradesBody.innerHTML = '';
+              const trades = Array.isArray(data && data.trades) ? data.trades : [];
+              if (!trades.length) {
+                analyticsTradesBody.innerHTML = '<tr><td colspan="6" class="analytics-empty">No completed trades in the simulation.</td></tr>';
+              } else {
+                trades.forEach(trade => {
+                  const row = document.createElement('tr');
+                  const entryDate = trade.entry_datetime ? new Date(trade.entry_datetime) : null;
+                  const exitDate = trade.exit_datetime ? new Date(trade.exit_datetime) : null;
+
+                  const entryCell = document.createElement('td');
+                  entryCell.textContent = entryDate && !Number.isNaN(entryDate.getTime()) ? entryDate.toLocaleString() : '—';
+
+                  const exitCell = document.createElement('td');
+                  exitCell.textContent = exitDate && !Number.isNaN(exitDate.getTime()) ? exitDate.toLocaleString() : '—';
+
+                  const stakeCell = document.createElement('td');
+                  stakeCell.textContent = formatUsd(trade.stake || 0, { withSign: false });
+
+                  const pnlCell = document.createElement('td');
+                  const pnlValue = Number(trade.pnl || 0);
+                  pnlCell.textContent = formatUsd(pnlValue);
+                  pnlCell.className = pnlValue >= 0 ? 'trade-profit' : 'trade-loss';
+
+                  const returnCell = document.createElement('td');
+                  const retValue = Number(trade.return_pct || 0);
+                  if (Number.isFinite(retValue)) {
+                    returnCell.textContent = `${(retValue * 100).toFixed(2)}%`;
+                  } else {
+                    returnCell.textContent = 'N/A';
+                  }
+                  returnCell.className = retValue >= 0 ? 'trade-profit' : 'trade-loss';
+
+                  const durationCell = document.createElement('td');
+                  const durationValue = Number(trade.duration_minutes || 0);
+                  durationCell.textContent = Number.isFinite(durationValue) ? durationValue.toFixed(1) : '0.0';
+
+                  row.append(entryCell, exitCell, stakeCell, pnlCell, returnCell, durationCell);
+                  analyticsTradesBody.appendChild(row);
+                });
+              }
+            }
+          }
+
+          async function runAnalyticsSimulation(auto = false) {
+            if (!analyticsStatus) return;
+            const mode = getAnalyticsMode();
+            const params = new URLSearchParams();
+            const modelValue = analyticsModelSelect ? analyticsModelSelect.value : 'logreg';
+            params.set('model', modelValue);
+            params.set('mode', mode);
+
+            const initialCashValue = analyticsInitialCashInput ? Number(analyticsInitialCashInput.value) : 1000;
+            if (Number.isFinite(initialCashValue) && initialCashValue > 0) {
+              params.set('initial_cash', String(initialCashValue));
+            }
+            if (mode === 'fixed') {
+              const betSizeValue = analyticsBetSizeInput ? Number(analyticsBetSizeInput.value) : 100;
+              if (Number.isFinite(betSizeValue) && betSizeValue >= 0) {
+                params.set('bet_size', String(betSizeValue));
+              }
+            }
+
+            analyticsStatus.textContent = 'Running simulation…';
+            if (analyticsRunButton) {
+              analyticsRunButton.disabled = true;
+            }
+
+            try {
+              const response = await fetch(`/api/analytics/simulation?${params.toString()}`);
+              const payload = await response.json();
+              if (!response.ok || (payload && payload.error)) {
+                throw new Error(payload && payload.error ? payload.error : `API error ${response.status}`);
+              }
+              renderAnalytics(payload);
+            } catch (error) {
+              console.error(error);
+              analyticsStatus.textContent = error && error.message ? error.message : 'Failed to run simulation.';
+              if (analyticsPriceChart && window.Plotly) {
+                Plotly.purge('analytics-price-chart');
+              }
+              if (analyticsEquityChart && window.Plotly) {
+                Plotly.purge('analytics-equity-chart');
+              }
+              if (analyticsTradesBody) {
+                analyticsTradesBody.innerHTML = '<tr><td colspan="6" class="analytics-empty">Simulation unavailable.</td></tr>';
+              }
+            } finally {
+              if (analyticsRunButton) {
+                analyticsRunButton.disabled = false;
               }
             }
           }
