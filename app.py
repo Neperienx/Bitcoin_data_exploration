@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -1084,6 +1084,141 @@ def _sample_points(sequence: List[Dict[str, object]], max_points: int) -> List[D
     return sampled
 
 
+def _compute_theoretical_best_equity(
+    frame: pd.DataFrame,
+    initial_cash: float,
+    fee_rate: float,
+) -> Dict[str, object]:
+    if frame.empty:
+        return {
+            "equity_curve": [],
+            "final_equity": float(initial_cash),
+            "return_pct": 0.0,
+        }
+
+    ordered = frame.reset_index(drop=True)
+    prices = ordered["close"].astype(float).to_numpy()
+    if prices.size == 0:
+        return {
+            "equity_curve": [],
+            "final_equity": float(initial_cash),
+            "return_pct": 0.0,
+        }
+
+    fee_rate = max(0.0, float(fee_rate))
+    timestamps = ordered["timestamp"].to_list()
+    datetimes = pd.to_datetime(ordered["datetime"]).to_list()
+
+    if fee_rate >= 1.0:
+        equity_points = []
+        for ts, dt in zip(timestamps, datetimes):
+            iso_time = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+            equity_points.append(
+                {
+                    "timestamp": int(ts),
+                    "datetime": iso_time,
+                    "equity": float(initial_cash),
+                }
+            )
+        return {
+            "equity_curve": equity_points,
+            "final_equity": float(initial_cash),
+            "return_pct": 0.0,
+        }
+
+    fee_adjustment = (1.0 - fee_rate) / (1.0 + fee_rate) if fee_rate < 1.0 else 0.0
+    trades: List[Tuple[int, int]] = []
+    i = 0
+    n = len(prices)
+    while i < n - 1:
+        while (
+            i < n - 1
+            and (
+                not np.isfinite(prices[i])
+                or not np.isfinite(prices[i + 1])
+                or prices[i] >= prices[i + 1]
+            )
+        ):
+            i += 1
+        if i >= n - 1:
+            break
+        buy_idx = i
+        while (
+            i < n - 1
+            and np.isfinite(prices[i])
+            and np.isfinite(prices[i + 1])
+            and prices[i] <= prices[i + 1]
+        ):
+            i += 1
+        sell_idx = i
+        if sell_idx > buy_idx:
+            buy_price = prices[buy_idx]
+            sell_price = prices[sell_idx]
+            if (
+                np.isfinite(buy_price)
+                and np.isfinite(sell_price)
+                and buy_price > 0
+                and sell_price > 0
+                and fee_adjustment > 0
+            ):
+                net_factor = (sell_price / buy_price) * fee_adjustment
+                if net_factor > 1.0 + 1e-9:
+                    trades.append((buy_idx, sell_idx))
+        # prevent infinite loops when prices are flat or invalid
+        if sell_idx == buy_idx:
+            i += 1
+
+    cash = float(initial_cash)
+    units = 0.0
+    equity_points: List[Dict[str, object]] = []
+    trade_index = 0
+    active_trade: Optional[Tuple[int, int]] = trades[trade_index] if trades else None
+
+    for idx, (ts, dt, price) in enumerate(zip(timestamps, datetimes, prices)):
+        price = float(price)
+        iso_time = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+        timestamp = int(ts)
+
+        if units > 0 and active_trade and idx == active_trade[1] and price > 0:
+            proceeds = units * price
+            sell_fee = proceeds * fee_rate
+            cash += proceeds - sell_fee
+            units = 0.0
+            trade_index += 1
+            active_trade = trades[trade_index] if trade_index < len(trades) else None
+
+        if (
+            units <= 0
+            and active_trade
+            and idx == active_trade[0]
+            and price > 0
+            and cash > 0
+        ):
+            stake = cash / (1.0 + fee_rate) if fee_rate > 0 else cash
+            if stake > 0:
+                buy_fee = stake * fee_rate
+                total_cost = stake + buy_fee
+                if total_cost <= cash + 1e-9:
+                    units = stake / price if price else 0.0
+                    cash -= total_cost
+
+        equity = cash + units * price if price > 0 else cash
+        equity_points.append({"timestamp": timestamp, "datetime": iso_time, "equity": equity})
+
+    final_equity = equity_points[-1]["equity"] if equity_points else float(initial_cash)
+    return_pct = (
+        (final_equity - float(initial_cash)) / float(initial_cash)
+        if initial_cash
+        else 0.0
+    )
+
+    return {
+        "equity_curve": equity_points,
+        "final_equity": final_equity,
+        "return_pct": return_pct,
+    }
+
+
 def _simulate_trades(
     frame: pd.DataFrame,
     mode: str,
@@ -1112,7 +1247,11 @@ def _simulate_trades(
                 "best_trade": 0.0,
                 "worst_trade": 0.0,
                 "exposure_ratio": 0.0,
+                "total_fees": 0.0,
+                "theoretical_final_equity": float(initial_cash),
+                "theoretical_return_pct": 0.0,
             },
+            "theoretical_equity_curve": [],
         }
 
     cash = float(initial_cash)
@@ -1277,6 +1416,11 @@ def _simulate_trades(
     )
     exposure_ratio = (exposure_minutes / total_minutes) if total_minutes > 0 else 0.0
 
+    theoretical = _compute_theoretical_best_equity(frame, initial_cash, fee_rate)
+    theoretical_curve = theoretical.get("equity_curve", [])
+    theoretical_final_equity = float(theoretical.get("final_equity", initial_cash))
+    theoretical_return_pct = float(theoretical.get("return_pct", 0.0))
+
     stats = {
         "trades": len(trades),
         "win_rate": win_rate,
@@ -1290,6 +1434,8 @@ def _simulate_trades(
         "worst_trade": worst_trade,
         "exposure_ratio": exposure_ratio,
         "total_fees": total_fees,
+        "theoretical_final_equity": theoretical_final_equity,
+        "theoretical_return_pct": theoretical_return_pct,
     }
 
     return {
@@ -1298,6 +1444,7 @@ def _simulate_trades(
         "buys": buy_markers,
         "sells": sell_markers,
         "stats": stats,
+        "theoretical_equity_curve": theoretical_curve,
     }
 
 
@@ -1378,6 +1525,19 @@ def _extract_minutes(args) -> int:
     return _coerce_minutes(args.get("steps"))
 
 
+def _extract_trade_minutes(args, default_steps: int) -> int:
+    try:
+        base = int(default_steps)
+    except (TypeError, ValueError):
+        base = 1
+    base = max(1, base)
+    if "trade_minutes" in args:
+        return _coerce_minutes(args.get("trade_minutes"), base)
+    if "trade_steps" in args:
+        return _coerce_minutes(args.get("trade_steps"), base)
+    return max(1, min(base, FORECAST_MAX_STEPS))
+
+
 @app.route("/api/logreg/sample")
 def api_logreg_sample():
     mode = request.args.get("mode", "random").lower()
@@ -1430,9 +1590,12 @@ def api_logreg_sample():
     history_preview = history_full.tail(LOGREG_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_slice.to_dict("records"),
+        simulation_steps=simulation_steps,
     )
 
     payload["horizon_minutes"] = len(forecasts)
@@ -1500,9 +1663,12 @@ def api_logreg_forecast():
 
     history_preview = history.tail(LOGREG_CONTEXT_WINDOW)
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_records,
+        simulation_steps=simulation_steps,
     )
 
     return jsonify(
@@ -1573,9 +1739,12 @@ def api_xgb_sample():
     history_preview = history_full.tail(XGB_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_slice.to_dict("records"),
+        simulation_steps=simulation_steps,
     )
 
     payload["horizon_minutes"] = len(forecasts)
@@ -1643,9 +1812,12 @@ def api_xgb_forecast():
 
     history_preview = history.tail(XGB_CONTEXT_WINDOW)
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_records,
+        simulation_steps=simulation_steps,
     )
 
     return jsonify(
@@ -1716,9 +1888,12 @@ def api_lstm_sample():
     history_preview = history_full.tail(LSTM_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_slice.to_dict("records"),
+        simulation_steps=simulation_steps,
     )
 
     payload["horizon_minutes"] = len(forecasts)
@@ -1786,9 +1961,12 @@ def api_lstm_forecast():
 
     history_preview = history.tail(LSTM_CONTEXT_WINDOW)
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_records,
+        simulation_steps=simulation_steps,
     )
 
     return jsonify(
@@ -1859,9 +2037,12 @@ def api_rf_sample():
     history_preview = history_full.tail(RF_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_slice.to_dict("records"),
+        simulation_steps=simulation_steps,
     )
 
     payload["horizon_minutes"] = len(forecasts)
@@ -1929,9 +2110,12 @@ def api_rf_forecast():
 
     history_preview = history.tail(RF_CONTEXT_WINDOW)
 
+    simulation_steps = _extract_trade_minutes(request.args, len(forecasts))
+
     trade_report = generate_trade_report(
         forecasts,
         ground_truth=gt_records,
+        simulation_steps=simulation_steps,
     )
 
     return jsonify(
@@ -2009,6 +2193,9 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
     equity_curve = _serialise_equity_curve(
         simulation.get("equity_curve", []), ANALYTICS_MAX_POINTS
     )
+    theoretical_curve = _serialise_equity_curve(
+        simulation.get("theoretical_equity_curve", []), ANALYTICS_MAX_POINTS
+    )
 
     trades_payload = []
     for trade in simulation.get("trades", []):
@@ -2057,6 +2244,7 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         "price_series": price_series,
         "equity_curve": equity_curve,
         "signals": {"buys": buy_markers, "sells": sell_markers},
+        "theoretical_equity_curve": theoretical_curve,
         "data_points": int(len(frame)),
         "sampled_points": int(len(price_series)),
     }
@@ -2285,6 +2473,14 @@ def index():
                 <h3>Max drawdown</h3>
                 <p id="analytics-stat-drawdown">0%</p>
               </div>
+              <div class="analytics-card">
+                <h3>Theoretical return</h3>
+                <p id="analytics-stat-theoretical-return">0%</p>
+              </div>
+              <div class="analytics-card">
+                <h3>Theoretical equity</h3>
+                <p id="analytics-stat-theoretical-equity">0 USDT</p>
+              </div>
             </div>
             <div class="analytics-charts">
               <div class="analytics-chart">
@@ -2367,6 +2563,10 @@ def index():
                   Forecast horizon (minutes)
                   <input type="number" id="forecast-steps" min="1" max="120" value="15">
                 </label>
+                <label>
+                  Time simulation (candles)
+                  <input type="number" id="logreg-trade-sim" min="1" max="120" value="15">
+                </label>
                 <button id="forecast-run">Run forecast</button>
                 <label class="toggle">
                   <input type="checkbox" id="forecast-latest-toggle">
@@ -2441,6 +2641,10 @@ def index():
                 <label>
                   Forecast horizon (minutes)
                   <input type="number" id="xgb-forecast-steps" min="1" max="120" value="15">
+                </label>
+                <label>
+                  Time simulation (candles)
+                  <input type="number" id="xgb-trade-sim" min="1" max="120" value="15">
                 </label>
                 <button id="xgb-forecast-run">Run forecast</button>
                 <label class="toggle">
@@ -2517,6 +2721,10 @@ def index():
                   Forecast horizon (minutes)
                   <input type="number" id="lstm-forecast-steps" min="1" max="120" value="15">
                 </label>
+                <label>
+                  Time simulation (candles)
+                  <input type="number" id="lstm-trade-sim" min="1" max="120" value="15">
+                </label>
                 <button id="lstm-forecast-run">Run forecast</button>
                 <label class="toggle">
                   <input type="checkbox" id="lstm-forecast-latest-toggle">
@@ -2591,6 +2799,10 @@ def index():
                 <label>
                   Forecast horizon (minutes)
                   <input type="number" id="rf-forecast-steps" min="1" max="120" value="15">
+                </label>
+                <label>
+                  Time simulation (candles)
+                  <input type="number" id="rf-trade-sim" min="1" max="120" value="15">
                 </label>
                 <button id="rf-forecast-run">Run forecast</button>
                 <label class="toggle">
@@ -2689,6 +2901,7 @@ def index():
           };
           const forecastRunButton = document.getElementById('forecast-run');
           const forecastStepsInput = document.getElementById('forecast-steps');
+          const logregTradeSimInput = document.getElementById('logreg-trade-sim');
           const forecastStatus = document.getElementById('forecast-status');
           const forecastToggle = document.getElementById('forecast-latest-toggle');
           const xgbRefreshButton = document.getElementById('xgb-refresh');
@@ -2703,6 +2916,7 @@ def index():
           const xgbSampleChart = document.getElementById('xgb-sample-chart');
           const xgbForecastRunButton = document.getElementById('xgb-forecast-run');
           const xgbForecastStepsInput = document.getElementById('xgb-forecast-steps');
+          const xgbTradeSimInput = document.getElementById('xgb-trade-sim');
           const xgbForecastStatus = document.getElementById('xgb-forecast-status');
           const xgbForecastToggle = document.getElementById('xgb-forecast-latest-toggle');
           const xgbForecastChart = document.getElementById('xgb-forecast-chart');
@@ -2718,6 +2932,7 @@ def index():
           const lstmSampleChart = document.getElementById('lstm-sample-chart');
           const lstmForecastRunButton = document.getElementById('lstm-forecast-run');
           const lstmForecastStepsInput = document.getElementById('lstm-forecast-steps');
+          const lstmTradeSimInput = document.getElementById('lstm-trade-sim');
           const lstmForecastStatus = document.getElementById('lstm-forecast-status');
           const lstmForecastToggle = document.getElementById('lstm-forecast-latest-toggle');
           const lstmForecastChart = document.getElementById('lstm-forecast-chart');
@@ -2733,6 +2948,7 @@ def index():
           const rfSampleChart = document.getElementById('rf-sample-chart');
           const rfForecastRunButton = document.getElementById('rf-forecast-run');
           const rfForecastStepsInput = document.getElementById('rf-forecast-steps');
+          const rfTradeSimInput = document.getElementById('rf-trade-sim');
           const rfForecastStatus = document.getElementById('rf-forecast-status');
           const rfForecastToggle = document.getElementById('rf-forecast-latest-toggle');
           const rfForecastChart = document.getElementById('rf-forecast-chart');
@@ -2754,6 +2970,8 @@ def index():
             pnl: document.getElementById('analytics-stat-pnl'),
             returnPct: document.getElementById('analytics-stat-return'),
             drawdown: document.getElementById('analytics-stat-drawdown'),
+            theoreticalReturn: document.getElementById('analytics-stat-theoretical-return'),
+            theoreticalEquity: document.getElementById('analytics-stat-theoretical-equity'),
           };
           let currentInterval = '1m';
           let logregHasLoaded = false;
@@ -3042,6 +3260,16 @@ def index():
             return `${(num * 100).toFixed(1)}%`;
           }
 
+          function clampSteps(input, fallback = 15) {
+            const base = Number.isFinite(Number(fallback)) ? Math.max(1, Math.round(Number(fallback))) : 15;
+            const raw = input ? Number(input.value) : base;
+            const bounded = Math.max(1, Math.min(Math.round(raw) || base, 120));
+            if (input) {
+              input.value = bounded;
+            }
+            return bounded;
+          }
+
           function renderTradeBotReport(report, elements) {
             if (!elements || !elements.container) {
               return;
@@ -3140,9 +3368,10 @@ def index():
             };
             const modelLabel = rawModel ? (modelMap[rawModel.toLowerCase()] || rawModel.toUpperCase()) : 'Analytics';
             const finalEquity = formatUsd(stats.final_equity || 0, { withSign: false });
+            const theoreticalEquityText = formatUsd(stats.theoretical_final_equity || stats.final_equity || 0, { withSign: false });
             const totalPoints = Number(data && data.data_points ? data.data_points : 0);
             const scopeText = totalPoints ? `${totalPoints.toLocaleString()} minutes` : 'test dataset';
-            analyticsStatus.textContent = `Simulation complete (${modelLabel}). Final equity ${finalEquity} across ${scopeText}.`;
+            analyticsStatus.textContent = `Simulation complete (${modelLabel}). Final equity ${finalEquity} across ${scopeText} · Theoretical best ${theoreticalEquityText}.`;
 
             if (analyticsStats.trades) {
               const tradesValue = Number(stats.trades || 0);
@@ -3162,6 +3391,13 @@ def index():
               analyticsStats.drawdown.textContent = drawdownValue
                 ? `-${(drawdownValue * 100).toFixed(1)}%`
                 : '0%';
+            }
+            if (analyticsStats.theoreticalReturn) {
+              analyticsStats.theoreticalReturn.textContent = formatPercent(stats.theoretical_return_pct || 0);
+            }
+            if (analyticsStats.theoreticalEquity) {
+              const theoreticalEquity = Number(stats.theoretical_final_equity || stats.final_equity || 0);
+              analyticsStats.theoreticalEquity.textContent = formatUsd(theoreticalEquity, { withSign: false });
             }
 
             const priceSeries = Array.isArray(data && data.price_series) ? data.price_series : [];
@@ -3210,23 +3446,37 @@ def index():
             }
 
             const equityCurve = Array.isArray(data && data.equity_curve) ? data.equity_curve : [];
-            const equityTrace = {
-              x: equityCurve.map(point => point.datetime),
-              y: equityCurve.map(point => Number(point.equity)),
-              type: 'scatter',
-              mode: 'lines',
-              name: 'Equity',
-              line: { color: '#f97316', width: 1.5 },
-            };
+            const theoreticalCurve = Array.isArray(data && data.theoretical_equity_curve) ? data.theoretical_equity_curve : [];
+            const equityTraces = [
+              {
+                x: equityCurve.map(point => point.datetime),
+                y: equityCurve.map(point => Number(point.equity)),
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Equity',
+                line: { color: '#f97316', width: 1.5 },
+              },
+            ];
+            if (theoreticalCurve.length) {
+              equityTraces.push({
+                x: theoreticalCurve.map(point => point.datetime),
+                y: theoreticalCurve.map(point => Number(point.equity)),
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Theoretical best',
+                line: { color: '#22c55e', width: 1.5, dash: 'dash' },
+              });
+            }
             const equityLayout = {
               paper_bgcolor: '#0f172a',
               plot_bgcolor: '#0f172a',
               font: { color: '#e2e8f0' },
               margin: { l: 60, r: 20, t: 30, b: 50 },
-              showlegend: false,
+              showlegend: theoreticalCurve.length > 0,
+              legend: { orientation: 'h' },
             };
             if (analyticsEquityChart && window.Plotly) {
-              Plotly.react('analytics-equity-chart', [equityTrace], equityLayout, { responsive: true, displaylogo: false });
+              Plotly.react('analytics-equity-chart', equityTraces, equityLayout, { responsive: true, displaylogo: false });
             }
 
             if (analyticsTradesBody) {
@@ -3333,17 +3583,13 @@ def index():
           }
 
           function getForecastMinutes() {
-            const rawValue = forecastStepsInput ? Number(forecastStepsInput.value) : 15;
-            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
-            if (forecastStepsInput) {
-              forecastStepsInput.value = bounded;
-            }
-            return bounded;
+            return clampSteps(forecastStepsInput, 15);
           }
 
           async function runForecast(auto = false) {
             if (!forecastStatus) return;
             const bounded = getForecastMinutes();
+            const tradeMinutes = clampSteps(logregTradeSimInput, bounded);
             const mode = forecastToggle && forecastToggle.checked ? 'latest' : 'random';
             forecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
             if (forecastRunButton) {
@@ -3351,7 +3597,7 @@ def index():
             }
             renderTradeBotReport(null, tradeUi.logregForecast);
             try {
-              const response = await fetch(`/api/logreg/forecast?minutes=${bounded}&mode=${mode}`);
+              const response = await fetch(`/api/logreg/forecast?minutes=${bounded}&mode=${mode}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -3478,7 +3724,8 @@ def index():
             renderTradeBotReport(null, tradeUi.logregSample);
             try {
               const minutes = getForecastMinutes();
-              const response = await fetch(`/api/logreg/sample?mode=${mode}&minutes=${minutes}`);
+              const tradeMinutes = clampSteps(logregTradeSimInput, minutes);
+              const response = await fetch(`/api/logreg/sample?mode=${mode}&minutes=${minutes}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -3622,17 +3869,13 @@ def index():
           }
 
           function getXgbForecastMinutes() {
-            const rawValue = xgbForecastStepsInput ? Number(xgbForecastStepsInput.value) : 15;
-            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
-            if (xgbForecastStepsInput) {
-              xgbForecastStepsInput.value = bounded;
-            }
-            return bounded;
+            return clampSteps(xgbForecastStepsInput, 15);
           }
 
           async function runXgbForecast(auto = false) {
             if (!xgbForecastStatus) return;
             const bounded = getXgbForecastMinutes();
+            const tradeMinutes = clampSteps(xgbTradeSimInput, bounded);
             const mode = xgbForecastToggle && xgbForecastToggle.checked ? 'latest' : 'random';
             xgbForecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
             if (xgbForecastRunButton) {
@@ -3640,7 +3883,7 @@ def index():
             }
             renderTradeBotReport(null, tradeUi.xgbForecast);
             try {
-              const response = await fetch(`/api/xgb/forecast?minutes=${bounded}&mode=${mode}`);
+              const response = await fetch(`/api/xgb/forecast?minutes=${bounded}&mode=${mode}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -3768,7 +4011,8 @@ def index():
             renderTradeBotReport(null, tradeUi.xgbSample);
             try {
               const minutes = getXgbForecastMinutes();
-              const response = await fetch(`/api/xgb/sample?mode=${mode}&minutes=${minutes}`);
+              const tradeMinutes = clampSteps(xgbTradeSimInput, minutes);
+              const response = await fetch(`/api/xgb/sample?mode=${mode}&minutes=${minutes}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -3912,17 +4156,13 @@ def index():
           }
 
           function getLstmForecastMinutes() {
-            const rawValue = lstmForecastStepsInput ? Number(lstmForecastStepsInput.value) : 15;
-            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
-            if (lstmForecastStepsInput) {
-              lstmForecastStepsInput.value = bounded;
-            }
-            return bounded;
+            return clampSteps(lstmForecastStepsInput, 15);
           }
 
           async function runLstmForecast(auto = false) {
             if (!lstmForecastStatus) return;
             const bounded = getLstmForecastMinutes();
+            const tradeMinutes = clampSteps(lstmTradeSimInput, bounded);
             const mode = lstmForecastToggle && lstmForecastToggle.checked ? 'latest' : 'random';
             lstmForecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
             if (lstmForecastRunButton) {
@@ -3930,7 +4170,7 @@ def index():
             }
             renderTradeBotReport(null, tradeUi.lstmForecast);
             try {
-              const response = await fetch(`/api/lstm/forecast?minutes=${bounded}&mode=${mode}`);
+              const response = await fetch(`/api/lstm/forecast?minutes=${bounded}&mode=${mode}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -4058,7 +4298,8 @@ def index():
             renderTradeBotReport(null, tradeUi.lstmSample);
             try {
               const minutes = getLstmForecastMinutes();
-              const response = await fetch(`/api/lstm/sample?mode=${mode}&minutes=${minutes}`);
+              const tradeMinutes = clampSteps(lstmTradeSimInput, minutes);
+              const response = await fetch(`/api/lstm/sample?mode=${mode}&minutes=${minutes}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -4202,17 +4443,13 @@ def index():
           }
 
           function getRfForecastMinutes() {
-            const rawValue = rfForecastStepsInput ? Number(rfForecastStepsInput.value) : 15;
-            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
-            if (rfForecastStepsInput) {
-              rfForecastStepsInput.value = bounded;
-            }
-            return bounded;
+            return clampSteps(rfForecastStepsInput, 15);
           }
 
           async function runRfForecast(auto = false) {
             if (!rfForecastStatus) return;
             const bounded = getRfForecastMinutes();
+            const tradeMinutes = clampSteps(rfTradeSimInput, bounded);
             const mode = rfForecastToggle && rfForecastToggle.checked ? 'latest' : 'random';
             rfForecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
             if (rfForecastRunButton) {
@@ -4220,7 +4457,7 @@ def index():
             }
             renderTradeBotReport(null, tradeUi.rfForecast);
             try {
-              const response = await fetch(`/api/rf/forecast?minutes=${bounded}&mode=${mode}`);
+              const response = await fetch(`/api/rf/forecast?minutes=${bounded}&mode=${mode}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
@@ -4348,7 +4585,8 @@ def index():
             renderTradeBotReport(null, tradeUi.rfSample);
             try {
               const minutes = getRfForecastMinutes();
-              const response = await fetch(`/api/rf/sample?mode=${mode}&minutes=${minutes}`);
+              const tradeMinutes = clampSteps(rfTradeSimInput, minutes);
+              const response = await fetch(`/api/rf/sample?mode=${mode}&minutes=${minutes}&trade_minutes=${tradeMinutes}`);
               const payload = await response.json();
               if (!response.ok || payload.error) {
                 throw new Error(payload.error || `API error ${response.status}`);
