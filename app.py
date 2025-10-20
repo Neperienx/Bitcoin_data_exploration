@@ -9,6 +9,7 @@ import random
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 from flask import Flask, jsonify, render_template_string, request
@@ -191,9 +192,9 @@ def _return_statistics(history: pd.DataFrame) -> Tuple[float, float]:
     negative = returns[returns < 0]
     pos_mean = float(positive.mean(skipna=True) or 0.0)
     neg_mean = float(negative.mean(skipna=True) or 0.0)
-    if not pd.isfinite(pos_mean):
+    if not np.isfinite(pos_mean):
         pos_mean = 0.0
-    if not pd.isfinite(neg_mean):
+    if not np.isfinite(neg_mean):
         neg_mean = 0.0
     return pos_mean, neg_mean
 
