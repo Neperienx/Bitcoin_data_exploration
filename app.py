@@ -37,6 +37,7 @@ from models.xgboost_model import (
     load_model as load_xgb_model,
     predict_xgb,
 )
+from trade_bot import generate_trade_report, serialise_trade_report
 
 APP_UPDATE_INTERVAL = 60  # seconds
 DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
@@ -1060,10 +1061,16 @@ def api_logreg_sample():
     history_preview = history_full.tail(LOGREG_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_slice.to_dict("records"),
+    )
+
     payload["horizon_minutes"] = len(forecasts)
     payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
     payload["forecast_candles"] = _serialise_forecast(forecasts)
     payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+    payload["trade_bot"] = serialise_trade_report(trade_report)
 
     return jsonify(payload)
 
@@ -1110,9 +1117,11 @@ def api_logreg_forecast():
         return jsonify({"error": "Unable to generate forecast."}), 500
 
     ground_truth: List[Dict[str, object]] = []
+    gt_records: List[Dict[str, object]] = []
     if mode == "random":
         gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
-        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+        gt_records = gt_slice.to_dict("records")
+        ground_truth = _serialise_candles(gt_records)
 
     anchor_payload = {
         "timestamp": int(anchor_row["timestamp"]),
@@ -1121,6 +1130,11 @@ def api_logreg_forecast():
     }
 
     history_preview = history.tail(LOGREG_CONTEXT_WINDOW)
+
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_records,
+    )
 
     return jsonify(
         {
@@ -1131,6 +1145,7 @@ def api_logreg_forecast():
             "ground_truth_candles": ground_truth,
             "history_candles": _serialise_candles(history_preview.to_dict("records")),
             "horizon_minutes": len(forecasts),
+            "trade_bot": serialise_trade_report(trade_report),
         }
     )
 
@@ -1189,10 +1204,16 @@ def api_xgb_sample():
     history_preview = history_full.tail(XGB_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_slice.to_dict("records"),
+    )
+
     payload["horizon_minutes"] = len(forecasts)
     payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
     payload["forecast_candles"] = _serialise_forecast(forecasts)
     payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+    payload["trade_bot"] = serialise_trade_report(trade_report)
 
     return jsonify(payload)
 
@@ -1239,9 +1260,11 @@ def api_xgb_forecast():
         return jsonify({"error": "Unable to generate forecast."}), 500
 
     ground_truth: List[Dict[str, object]] = []
+    gt_records: List[Dict[str, object]] = []
     if mode == "random":
         gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
-        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+        gt_records = gt_slice.to_dict("records")
+        ground_truth = _serialise_candles(gt_records)
 
     anchor_payload = {
         "timestamp": int(anchor_row["timestamp"]),
@@ -1250,6 +1273,11 @@ def api_xgb_forecast():
     }
 
     history_preview = history.tail(XGB_CONTEXT_WINDOW)
+
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_records,
+    )
 
     return jsonify(
         {
@@ -1260,6 +1288,7 @@ def api_xgb_forecast():
             "ground_truth_candles": ground_truth,
             "history_candles": _serialise_candles(history_preview.to_dict("records")),
             "horizon_minutes": len(forecasts),
+            "trade_bot": serialise_trade_report(trade_report),
         }
     )
 
@@ -1318,10 +1347,16 @@ def api_lstm_sample():
     history_preview = history_full.tail(LSTM_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_slice.to_dict("records"),
+    )
+
     payload["horizon_minutes"] = len(forecasts)
     payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
     payload["forecast_candles"] = _serialise_forecast(forecasts)
     payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+    payload["trade_bot"] = serialise_trade_report(trade_report)
 
     return jsonify(payload)
 
@@ -1368,9 +1403,11 @@ def api_lstm_forecast():
         return jsonify({"error": "Unable to generate forecast."}), 500
 
     ground_truth: List[Dict[str, object]] = []
+    gt_records: List[Dict[str, object]] = []
     if mode == "random":
         gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
-        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+        gt_records = gt_slice.to_dict("records")
+        ground_truth = _serialise_candles(gt_records)
 
     anchor_payload = {
         "timestamp": int(anchor_row["timestamp"]),
@@ -1379,6 +1416,11 @@ def api_lstm_forecast():
     }
 
     history_preview = history.tail(LSTM_CONTEXT_WINDOW)
+
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_records,
+    )
 
     return jsonify(
         {
@@ -1389,6 +1431,7 @@ def api_lstm_forecast():
             "ground_truth_candles": ground_truth,
             "history_candles": _serialise_candles(history_preview.to_dict("records")),
             "horizon_minutes": len(forecasts),
+            "trade_bot": serialise_trade_report(trade_report),
         }
     )
 
@@ -1447,10 +1490,16 @@ def api_rf_sample():
     history_preview = history_full.tail(RF_CONTEXT_WINDOW)
     gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
 
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_slice.to_dict("records"),
+    )
+
     payload["horizon_minutes"] = len(forecasts)
     payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
     payload["forecast_candles"] = _serialise_forecast(forecasts)
     payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+    payload["trade_bot"] = serialise_trade_report(trade_report)
 
     return jsonify(payload)
 
@@ -1497,9 +1546,11 @@ def api_rf_forecast():
         return jsonify({"error": "Unable to generate forecast."}), 500
 
     ground_truth: List[Dict[str, object]] = []
+    gt_records: List[Dict[str, object]] = []
     if mode == "random":
         gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
-        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+        gt_records = gt_slice.to_dict("records")
+        ground_truth = _serialise_candles(gt_records)
 
     anchor_payload = {
         "timestamp": int(anchor_row["timestamp"]),
@@ -1508,6 +1559,11 @@ def api_rf_forecast():
     }
 
     history_preview = history.tail(RF_CONTEXT_WINDOW)
+
+    trade_report = generate_trade_report(
+        forecasts,
+        ground_truth=gt_records,
+    )
 
     return jsonify(
         {
@@ -1518,6 +1574,7 @@ def api_rf_forecast():
             "ground_truth_candles": ground_truth,
             "history_candles": _serialise_candles(history_preview.to_dict("records")),
             "horizon_minutes": len(forecasts),
+            "trade_bot": serialise_trade_report(trade_report),
         }
     )
 
@@ -1569,6 +1626,16 @@ def index():
           .logreg-sample-chart { margin-top: 1.5rem; }
           .logreg-sample-chart h3 { margin: 0 0 0.6rem 0; font-size: 1rem; }
           #logreg-sample-chart { width: 100%; height: 45vh; }
+          .trade-bot { margin-top: 1.5rem; background: #0f172a; border-radius: 0.9rem; padding: 1rem 1.25rem; border: 1px solid rgba(148,163,184,0.2); }
+          .trade-bot h3 { margin: 0 0 0.6rem 0; font-size: 1rem; }
+          .trade-bot-summary { margin: 0 0 0.8rem 0; font-size: 0.95rem; color: #cbd5f5; }
+          .trade-bot-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-bottom: 0.75rem; }
+          .trade-bot-metrics p { margin: 0; font-size: 0.95rem; }
+          .trade-bot-orders h4 { margin: 0 0 0.4rem 0; font-size: 0.9rem; color: #cbd5f5; }
+          .trade-bot-orders ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+          .trade-bot-orders li { background: #111827; border-radius: 0.7rem; padding: 0.6rem 0.8rem; border: 1px solid rgba(148,163,184,0.2); font-size: 0.9rem; }
+          .trade-profit { color: #22c55e; }
+          .trade-loss { color: #ef4444; }
           .toggle { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; user-select: none; }
           .toggle input { width: 1.1rem; height: 1.1rem; }
           .logreg-forecast { margin-top: 2rem; }
@@ -1680,6 +1747,18 @@ def index():
                 <h3>Feature values</h3>
                 <ul id="logreg-feature-list"></ul>
               </div>
+              <div class="trade-bot" id="logreg-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="logreg-trade-summary" class="trade-bot-summary">Activate the card to load trade bot insights.</p>
+                <div class="trade-bot-metrics">
+                  <p id="logreg-trade-state"></p>
+                  <p id="logreg-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="logreg-trade-orders"></ul>
+                </div>
+              </div>
               <div class="logreg-sample-chart">
                 <h3>Model input and predicted candles</h3>
                 <div id="logreg-sample-chart"></div>
@@ -1698,6 +1777,18 @@ def index():
                 </label>
               </div>
               <div class="status" id="forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div class="trade-bot" id="forecast-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="forecast-trade-summary" class="trade-bot-summary">Run a forecast to see trade actions.</p>
+                <div class="trade-bot-metrics">
+                  <p id="forecast-trade-state"></p>
+                  <p id="forecast-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="forecast-trade-orders"></ul>
+                </div>
+              </div>
               <div id="forecast-chart"></div>
             </div>
           </section>
@@ -1731,6 +1822,18 @@ def index():
                 <h3>Feature values</h3>
                 <ul id="xgb-feature-list"></ul>
               </div>
+              <div class="trade-bot" id="xgb-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="xgb-trade-summary" class="trade-bot-summary">Activate the card to load trade bot insights.</p>
+                <div class="trade-bot-metrics">
+                  <p id="xgb-trade-state"></p>
+                  <p id="xgb-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="xgb-trade-orders"></ul>
+                </div>
+              </div>
               <div class="xgb-sample-chart">
                 <h3>Model input and predicted candles</h3>
                 <div id="xgb-sample-chart"></div>
@@ -1749,6 +1852,18 @@ def index():
                 </label>
               </div>
               <div class="status" id="xgb-forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div class="trade-bot" id="xgb-forecast-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="xgb-forecast-trade-summary" class="trade-bot-summary">Run a forecast to see trade actions.</p>
+                <div class="trade-bot-metrics">
+                  <p id="xgb-forecast-trade-state"></p>
+                  <p id="xgb-forecast-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="xgb-forecast-trade-orders"></ul>
+                </div>
+              </div>
               <div id="xgb-forecast-chart"></div>
             </div>
           </section>
@@ -1782,6 +1897,18 @@ def index():
                 <h3>Feature values</h3>
                 <ul id="lstm-feature-list"></ul>
               </div>
+              <div class="trade-bot" id="lstm-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="lstm-trade-summary" class="trade-bot-summary">Activate the card to load trade bot insights.</p>
+                <div class="trade-bot-metrics">
+                  <p id="lstm-trade-state"></p>
+                  <p id="lstm-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="lstm-trade-orders"></ul>
+                </div>
+              </div>
               <div class="lstm-sample-chart">
                 <h3>Model input and predicted candles</h3>
                 <div id="lstm-sample-chart"></div>
@@ -1800,6 +1927,18 @@ def index():
                 </label>
               </div>
               <div class="status" id="lstm-forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div class="trade-bot" id="lstm-forecast-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="lstm-forecast-trade-summary" class="trade-bot-summary">Run a forecast to see trade actions.</p>
+                <div class="trade-bot-metrics">
+                  <p id="lstm-forecast-trade-state"></p>
+                  <p id="lstm-forecast-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="lstm-forecast-trade-orders"></ul>
+                </div>
+              </div>
               <div id="lstm-forecast-chart"></div>
             </div>
           </section>
@@ -1833,6 +1972,18 @@ def index():
                 <h3>Feature values</h3>
                 <ul id="rf-feature-list"></ul>
               </div>
+              <div class="trade-bot" id="rf-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="rf-trade-summary" class="trade-bot-summary">Activate the card to load trade bot insights.</p>
+                <div class="trade-bot-metrics">
+                  <p id="rf-trade-state"></p>
+                  <p id="rf-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="rf-trade-orders"></ul>
+                </div>
+              </div>
               <div class="rf-sample-chart">
                 <h3>Model input and predicted candles</h3>
                 <div id="rf-sample-chart"></div>
@@ -1851,6 +2002,18 @@ def index():
                 </label>
               </div>
               <div class="status" id="rf-forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div class="trade-bot" id="rf-forecast-trade" hidden>
+                <h3>Trade bot recommendation</h3>
+                <p id="rf-forecast-trade-summary" class="trade-bot-summary">Run a forecast to see trade actions.</p>
+                <div class="trade-bot-metrics">
+                  <p id="rf-forecast-trade-state"></p>
+                  <p id="rf-forecast-trade-performance"></p>
+                </div>
+                <div class="trade-bot-orders">
+                  <h4>Orders</h4>
+                  <ul id="rf-forecast-trade-orders"></ul>
+                </div>
+              </div>
               <div id="rf-forecast-chart"></div>
             </div>
           </section>
@@ -1869,6 +2032,64 @@ def index():
           const logregProbability = document.getElementById('logreg-probability');
           const logregFeatureList = document.getElementById('logreg-feature-list');
           const logregSampleChart = document.getElementById('logreg-sample-chart');
+          const tradeUi = {
+            logregSample: {
+              container: document.getElementById('logreg-trade'),
+              summary: document.getElementById('logreg-trade-summary'),
+              state: document.getElementById('logreg-trade-state'),
+              performance: document.getElementById('logreg-trade-performance'),
+              orders: document.getElementById('logreg-trade-orders'),
+            },
+            logregForecast: {
+              container: document.getElementById('forecast-trade'),
+              summary: document.getElementById('forecast-trade-summary'),
+              state: document.getElementById('forecast-trade-state'),
+              performance: document.getElementById('forecast-trade-performance'),
+              orders: document.getElementById('forecast-trade-orders'),
+            },
+            xgbSample: {
+              container: document.getElementById('xgb-trade'),
+              summary: document.getElementById('xgb-trade-summary'),
+              state: document.getElementById('xgb-trade-state'),
+              performance: document.getElementById('xgb-trade-performance'),
+              orders: document.getElementById('xgb-trade-orders'),
+            },
+            xgbForecast: {
+              container: document.getElementById('xgb-forecast-trade'),
+              summary: document.getElementById('xgb-forecast-trade-summary'),
+              state: document.getElementById('xgb-forecast-trade-state'),
+              performance: document.getElementById('xgb-forecast-trade-performance'),
+              orders: document.getElementById('xgb-forecast-trade-orders'),
+            },
+            lstmSample: {
+              container: document.getElementById('lstm-trade'),
+              summary: document.getElementById('lstm-trade-summary'),
+              state: document.getElementById('lstm-trade-state'),
+              performance: document.getElementById('lstm-trade-performance'),
+              orders: document.getElementById('lstm-trade-orders'),
+            },
+            lstmForecast: {
+              container: document.getElementById('lstm-forecast-trade'),
+              summary: document.getElementById('lstm-forecast-trade-summary'),
+              state: document.getElementById('lstm-forecast-trade-state'),
+              performance: document.getElementById('lstm-forecast-trade-performance'),
+              orders: document.getElementById('lstm-forecast-trade-orders'),
+            },
+            rfSample: {
+              container: document.getElementById('rf-trade'),
+              summary: document.getElementById('rf-trade-summary'),
+              state: document.getElementById('rf-trade-state'),
+              performance: document.getElementById('rf-trade-performance'),
+              orders: document.getElementById('rf-trade-orders'),
+            },
+            rfForecast: {
+              container: document.getElementById('rf-forecast-trade'),
+              summary: document.getElementById('rf-forecast-trade-summary'),
+              state: document.getElementById('rf-forecast-trade-state'),
+              performance: document.getElementById('rf-forecast-trade-performance'),
+              orders: document.getElementById('rf-forecast-trade-orders'),
+            },
+          };
           const forecastRunButton = document.getElementById('forecast-run');
           const forecastStepsInput = document.getElementById('forecast-steps');
           const forecastStatus = document.getElementById('forecast-status');
@@ -2157,6 +2378,110 @@ def index():
             }
           }
 
+          function formatUsd(value, { withSign = true } = {}) {
+            const num = Number(value);
+            if (!Number.isFinite(num)) {
+              return 'N/A';
+            }
+            const formatted = num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            if (!withSign) {
+              return `${formatted} USDT`;
+            }
+            if (num > 0) {
+              return `+${formatted} USDT`;
+            }
+            return `${formatted} USDT`;
+          }
+
+          function formatUnits(value, unit = 'BTC') {
+            const num = Number(value);
+            if (!Number.isFinite(num)) {
+              return `0.0000 ${unit}`;
+            }
+            return `${num.toFixed(4)} ${unit}`;
+          }
+
+          function formatPercent(value) {
+            const num = Number(value);
+            if (!Number.isFinite(num)) {
+              return 'N/A';
+            }
+            return `${(num * 100).toFixed(1)}%`;
+          }
+
+          function renderTradeBotReport(report, elements) {
+            if (!elements || !elements.container) {
+              return;
+            }
+            const { container, summary, state, performance, orders } = elements;
+            if (!report) {
+              container.hidden = true;
+              if (summary) {
+                summary.textContent = 'Trade bot insights unavailable.';
+              }
+              if (state) {
+                state.textContent = '';
+              }
+              if (performance) {
+                performance.textContent = '';
+              }
+              if (orders) {
+                orders.innerHTML = '';
+              }
+              return;
+            }
+
+            container.hidden = false;
+            if (summary) {
+              summary.textContent = report.summary || 'Trade bot analysis ready.';
+            }
+
+            const finalState = report.final_state || {};
+            if (state) {
+              const cashText = formatUsd(finalState.cash);
+              const positionText = formatUnits(finalState.position);
+              const equityText = formatUsd(finalState.total_value, { withSign: false });
+              state.textContent = `Cash: ${cashText} · Position: ${positionText} · Equity: ${equityText}`;
+            }
+
+            if (performance) {
+              const evaluation = report.evaluation || {};
+              if (evaluation.available) {
+                const realized = Number(evaluation.realized_pl);
+                const realizedText = formatUsd(realized);
+                const realizedClass = realized >= 0 ? 'trade-profit' : 'trade-loss';
+                const totalValue = formatUsd(evaluation.total_value, { withSign: false });
+                performance.innerHTML = `Realized P/L: <span class="${realizedClass}">${realizedText}</span> · Total value: ${totalValue}`;
+              } else {
+                performance.textContent = 'Ground truth not yet available to score this plan.';
+              }
+            }
+
+            if (orders) {
+              orders.innerHTML = '';
+              const list = Array.isArray(report.orders) ? report.orders : [];
+              if (!list.length) {
+                const li = document.createElement('li');
+                li.textContent = 'No buy or sell signals — staying in cash.';
+                orders.appendChild(li);
+              } else {
+                list.forEach((order) => {
+                  const li = document.createElement('li');
+                  const action = typeof order.action === 'string' ? order.action.toUpperCase() : String(order.action || 'HOLD');
+                  const dt = order.datetime ? new Date(order.datetime) : null;
+                  const stepIndex = Number.isFinite(Number(order.step)) ? Number(order.step) + 1 : '';
+                  const when = dt && !Number.isNaN(dt.getTime()) ? dt.toLocaleString() : stepIndex ? `Step ${stepIndex}` : 'Unknown time';
+                  const priceText = formatUsd(order.price, { withSign: false });
+                  const probText = formatPercent(order.probability);
+                  const expected = Number(order.expected_return);
+                  const expectedText = Number.isFinite(expected) ? `${(expected * 100).toFixed(2)}% exp. return` : 'Exp. return N/A';
+                  li.textContent = `${action} @ ${when} · Price ${priceText} · Prob ${probText} · ${expectedText}`;
+                  orders.appendChild(li);
+                });
+              }
+            }
+          }
+
           function getForecastMinutes() {
             const rawValue = forecastStepsInput ? Number(forecastStepsInput.value) : 15;
             const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
@@ -2174,6 +2499,7 @@ def index():
             if (forecastRunButton) {
               forecastRunButton.disabled = true;
             }
+            renderTradeBotReport(null, tradeUi.logregForecast);
             try {
               const response = await fetch(`/api/logreg/forecast?minutes=${bounded}&mode=${mode}`);
               const payload = await response.json();
@@ -2204,6 +2530,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.logregForecast);
               return;
             }
 
@@ -2228,6 +2555,7 @@ def index():
               statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
             }
             forecastStatus.textContent = statusParts.join(' · ');
+            renderTradeBotReport(data.trade_bot, tradeUi.logregForecast);
 
             const traces = [];
 
@@ -2297,6 +2625,7 @@ def index():
             const mode = useLatest ? 'latest' : 'random';
             logregStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
             logregCard.hidden = true;
+            renderTradeBotReport(null, tradeUi.logregSample);
             try {
               const minutes = getForecastMinutes();
               const response = await fetch(`/api/logreg/sample?mode=${mode}&minutes=${minutes}`);
@@ -2311,6 +2640,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('logreg-sample-chart');
               }
+              renderTradeBotReport(null, tradeUi.logregSample);
             }
           }
 
@@ -2363,6 +2693,7 @@ def index():
             });
 
             renderLogregSampleChart(data);
+            renderTradeBotReport(data.trade_bot, tradeUi.logregSample);
             logregCard.hidden = false;
           }
 
@@ -2457,6 +2788,7 @@ def index():
             if (xgbForecastRunButton) {
               xgbForecastRunButton.disabled = true;
             }
+            renderTradeBotReport(null, tradeUi.xgbForecast);
             try {
               const response = await fetch(`/api/xgb/forecast?minutes=${bounded}&mode=${mode}`);
               const payload = await response.json();
@@ -2470,6 +2802,7 @@ def index():
               if (!auto && window.Plotly) {
                 Plotly.purge('xgb-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.xgbForecast);
             } finally {
               if (xgbForecastRunButton) {
                 xgbForecastRunButton.disabled = false;
@@ -2487,6 +2820,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('xgb-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.xgbForecast);
               return;
             }
 
@@ -2511,6 +2845,7 @@ def index():
               statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
             }
             xgbForecastStatus.textContent = statusParts.join(' · ');
+            renderTradeBotReport(data.trade_bot, tradeUi.xgbForecast);
 
             const traces = [];
 
@@ -2580,6 +2915,7 @@ def index():
             const mode = useLatest ? 'latest' : 'random';
             xgbStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
             xgbCard.hidden = true;
+            renderTradeBotReport(null, tradeUi.xgbSample);
             try {
               const minutes = getXgbForecastMinutes();
               const response = await fetch(`/api/xgb/sample?mode=${mode}&minutes=${minutes}`);
@@ -2594,6 +2930,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('xgb-sample-chart');
               }
+              renderTradeBotReport(null, tradeUi.xgbSample);
             }
           }
 
@@ -2646,6 +2983,7 @@ def index():
             });
 
             renderXgbSampleChart(data);
+            renderTradeBotReport(data.trade_bot, tradeUi.xgbSample);
             xgbCard.hidden = false;
           }
 
@@ -2740,6 +3078,7 @@ def index():
             if (lstmForecastRunButton) {
               lstmForecastRunButton.disabled = true;
             }
+            renderTradeBotReport(null, tradeUi.lstmForecast);
             try {
               const response = await fetch(`/api/lstm/forecast?minutes=${bounded}&mode=${mode}`);
               const payload = await response.json();
@@ -2753,6 +3092,7 @@ def index():
               if (!auto && window.Plotly) {
                 Plotly.purge('lstm-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.lstmForecast);
             } finally {
               if (lstmForecastRunButton) {
                 lstmForecastRunButton.disabled = false;
@@ -2770,6 +3110,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('lstm-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.lstmForecast);
               return;
             }
 
@@ -2794,6 +3135,7 @@ def index():
               statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
             }
             lstmForecastStatus.textContent = statusParts.join(' · ');
+            renderTradeBotReport(data.trade_bot, tradeUi.lstmForecast);
 
             const traces = [];
 
@@ -2863,6 +3205,7 @@ def index():
             const mode = useLatest ? 'latest' : 'random';
             lstmStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
             lstmCard.hidden = true;
+            renderTradeBotReport(null, tradeUi.lstmSample);
             try {
               const minutes = getLstmForecastMinutes();
               const response = await fetch(`/api/lstm/sample?mode=${mode}&minutes=${minutes}`);
@@ -2877,6 +3220,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('lstm-sample-chart');
               }
+              renderTradeBotReport(null, tradeUi.lstmSample);
             }
           }
 
@@ -2929,6 +3273,7 @@ def index():
             });
 
             renderLstmSampleChart(data);
+            renderTradeBotReport(data.trade_bot, tradeUi.lstmSample);
             lstmCard.hidden = false;
           }
 
@@ -3023,6 +3368,7 @@ def index():
             if (rfForecastRunButton) {
               rfForecastRunButton.disabled = true;
             }
+            renderTradeBotReport(null, tradeUi.rfForecast);
             try {
               const response = await fetch(`/api/rf/forecast?minutes=${bounded}&mode=${mode}`);
               const payload = await response.json();
@@ -3036,6 +3382,7 @@ def index():
               if (!auto && window.Plotly) {
                 Plotly.purge('rf-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.rfForecast);
             } finally {
               if (rfForecastRunButton) {
                 rfForecastRunButton.disabled = false;
@@ -3053,6 +3400,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('rf-forecast-chart');
               }
+              renderTradeBotReport(null, tradeUi.rfForecast);
               return;
             }
 
@@ -3077,6 +3425,7 @@ def index():
               statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
             }
             rfForecastStatus.textContent = statusParts.join(' · ');
+            renderTradeBotReport(data.trade_bot, tradeUi.rfForecast);
 
             const traces = [];
 
@@ -3146,6 +3495,7 @@ def index():
             const mode = useLatest ? 'latest' : 'random';
             rfStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
             rfCard.hidden = true;
+            renderTradeBotReport(null, tradeUi.rfSample);
             try {
               const minutes = getRfForecastMinutes();
               const response = await fetch(`/api/rf/sample?mode=${mode}&minutes=${minutes}`);
@@ -3160,6 +3510,7 @@ def index():
               if (window.Plotly) {
                 Plotly.purge('rf-sample-chart');
               }
+              renderTradeBotReport(null, tradeUi.rfSample);
             }
           }
 
@@ -3212,6 +3563,7 @@ def index():
             });
 
             renderRfSampleChart(data);
+            renderTradeBotReport(data.trade_bot, tradeUi.rfSample);
             rfCard.hidden = false;
           }
 
