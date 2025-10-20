@@ -47,6 +47,7 @@ DEFAULT_ANALYTICS_INITIAL_CASH = 1000.0
 DEFAULT_ANALYTICS_BET_SIZE = 100.0
 DEFAULT_ANALYTICS_TRANSACTION_FEE = 0.0  # percent
 DEFAULT_ANALYTICS_BUY_CONFIDENCE = 0.0  # percent
+DEFAULT_ANALYTICS_THEORETICAL_MIN_GAIN = 0.2  # percent
 ANALYTICS_MAX_POINTS = 5000
 LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
 RF_MODEL_PATH = Path("models/artifacts/rf.pkl")
@@ -1088,6 +1089,7 @@ def _compute_theoretical_best_equity(
     frame: pd.DataFrame,
     initial_cash: float,
     fee_rate: float,
+    min_gain: float = 0.002,
 ) -> Dict[str, object]:
     if frame.empty:
         return {
@@ -1106,6 +1108,7 @@ def _compute_theoretical_best_equity(
         }
 
     fee_rate = max(0.0, float(fee_rate))
+    min_gain = max(0.0, float(min_gain))
     timestamps = ordered["timestamp"].to_list()
     datetimes = pd.to_datetime(ordered["datetime"]).to_list()
 
@@ -1127,6 +1130,7 @@ def _compute_theoretical_best_equity(
         }
 
     fee_adjustment = (1.0 - fee_rate) / (1.0 + fee_rate) if fee_rate < 1.0 else 0.0
+    min_gain_factor = 1.0 + min_gain
     trades: List[Tuple[int, int]] = []
     i = 0
     n = len(prices)
@@ -1162,7 +1166,7 @@ def _compute_theoretical_best_equity(
                 and fee_adjustment > 0
             ):
                 net_factor = (sell_price / buy_price) * fee_adjustment
-                if net_factor > 1.0 + 1e-9:
+                if net_factor >= min_gain_factor - 1e-9:
                     trades.append((buy_idx, sell_idx))
         # prevent infinite loops when prices are flat or invalid
         if sell_idx == buy_idx:
@@ -1226,6 +1230,7 @@ def _simulate_trades(
     bet_size: float,
     transaction_fee_pct: float,
     buy_confidence_pct: float,
+    theoretical_min_gain_pct: float,
 ) -> Dict[str, object]:
     """Simulate trades over ``frame`` using the trade bot heuristics."""
 
@@ -1271,6 +1276,7 @@ def _simulate_trades(
     bet_size = max(0.0, float(bet_size))
     fee_rate = max(0.0, float(transaction_fee_pct)) / 100.0
     buy_confidence = max(0.0, float(buy_confidence_pct)) / 100.0
+    theoretical_min_gain = max(0.0, float(theoretical_min_gain_pct)) / 100.0
 
     timestamps = frame["timestamp"].to_numpy(dtype="int64")
 
@@ -1416,7 +1422,9 @@ def _simulate_trades(
     )
     exposure_ratio = (exposure_minutes / total_minutes) if total_minutes > 0 else 0.0
 
-    theoretical = _compute_theoretical_best_equity(frame, initial_cash, fee_rate)
+    theoretical = _compute_theoretical_best_equity(
+        frame, initial_cash, fee_rate, theoretical_min_gain
+    )
     theoretical_curve = theoretical.get("equity_curve", [])
     theoretical_final_equity = float(theoretical.get("final_equity", initial_cash))
     theoretical_return_pct = float(theoretical.get("return_pct", 0.0))
@@ -2156,6 +2164,14 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         )
     except ValueError:
         buy_confidence = DEFAULT_ANALYTICS_BUY_CONFIDENCE
+    try:
+        theoretical_min_gain = float(
+            request.args.get(
+                "theoretical_min_gain", DEFAULT_ANALYTICS_THEORETICAL_MIN_GAIN
+            )
+        )
+    except ValueError:
+        theoretical_min_gain = DEFAULT_ANALYTICS_THEORETICAL_MIN_GAIN
 
     try:
         dataset = _load_analytics_dataset()
@@ -2185,6 +2201,7 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
             bet_size,
             transaction_fee,
             buy_confidence,
+            theoretical_min_gain,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -2239,6 +2256,7 @@ def api_analytics_simulation() -> Tuple[Any, int] | Any:
         "bet_size": float(bet_size),
         "transaction_fee": float(transaction_fee),
         "buy_confidence": float(buy_confidence),
+        "theoretical_min_gain": float(theoretical_min_gain),
         "stats": simulation.get("stats", {}),
         "trades": trades_payload,
         "price_series": price_series,
