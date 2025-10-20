@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,15 +17,26 @@ from sklearn.pipeline import Pipeline
 
 from mlops.features import make_basic_features, make_label
 from mlops.split import time_train_test_split
-from models.logistic_regression import FEATURE_ORDER, load_model, predict_logreg
+from models.logistic_regression import (
+    FEATURE_ORDER as LOGREG_FEATURE_ORDER,
+    load_model as load_logreg_model,
+    predict_logreg,
+)
+from models.random_forest import (
+    FEATURE_ORDER as RF_FEATURE_ORDER,
+    load_model as load_rf_model,
+    predict_rf,
+)
 
 APP_UPDATE_INTERVAL = 60  # seconds
 DATA_FILE = Path("data/btc_usdt_1m_all.parquet")
 LOGREG_MODEL_PATH = Path("models/artifacts/logreg.pkl")
+RF_MODEL_PATH = Path("models/artifacts/rf.pkl")
 DEFAULT_LOOKBACK = timedelta(days=7)
 BINANCE_REST = "https://api.binance.com/api/v3/klines"
 MAX_KLINES = 1000
 LOGREG_CONTEXT_WINDOW = 60
+RF_CONTEXT_WINDOW = 60
 
 app = Flask(__name__)
 
@@ -33,8 +44,11 @@ data_lock = threading.Lock()
 background_started = False
 candles_df: pd.DataFrame | None = None
 logreg_model = None
+rf_model = None
 logreg_samples: List[Dict[str, object]] = []
 logreg_latest_sample: Dict[str, object] | None = None
+rf_samples: List[Dict[str, object]] = []
+rf_latest_sample: Dict[str, object] | None = None
 FORECAST_MAX_STEPS = 120
 
 
@@ -55,7 +69,7 @@ def _ensure_logreg_model_loaded() -> None:
     if not LOGREG_MODEL_PATH.exists():
         return
     try:
-        logreg_model = load_model(LOGREG_MODEL_PATH)
+        logreg_model = load_logreg_model(LOGREG_MODEL_PATH)
     except Exception as exc:  # pragma: no cover - defensive logging
         app.logger.warning("Failed to load logistic regression model: %s", exc)
         logreg_model = None
@@ -97,11 +111,11 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
         ],
         axis=1,
     )
-    dataset = dataset.dropna(subset=FEATURE_ORDER + ["label"])
+    dataset = dataset.dropna(subset=LOGREG_FEATURE_ORDER + ["label"])
 
     samples: List[Dict[str, object]] = []
     if not dataset.empty:
-        X = dataset.loc[:, FEATURE_ORDER]
+        X = dataset.loc[:, LOGREG_FEATURE_ORDER]
         y = dataset.loc[:, "label"].astype(int)
         X_train, X_test, y_train, y_test = time_train_test_split(X, y)
         if not X_test.empty:
@@ -114,7 +128,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
             meta["ground_truth"] = y_test
             meta["prediction"] = preds
             meta["probability"] = probs
-            for feature in FEATURE_ORDER:
+            for feature in LOGREG_FEATURE_ORDER:
                 meta[feature] = dataset.loc[X_test.index, feature]
             meta["anchor_timestamp"] = dataset.loc[X_test.index, "timestamp"].astype("int64")
             samples = [
@@ -127,7 +141,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
                     "prediction": int(row["prediction"]),
                     "probability": float(row["probability"]),
                     "features": {
-                        feature: float(row[feature]) for feature in FEATURE_ORDER
+                        feature: float(row[feature]) for feature in LOGREG_FEATURE_ORDER
                     },
                     "anchor_timestamp": int(row["anchor_timestamp"]),
                 }
@@ -135,7 +149,7 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
             ]
 
     latest_record: Dict[str, object] | None = None
-    feature_view = features.loc[:, FEATURE_ORDER].dropna()
+    feature_view = features.loc[:, LOGREG_FEATURE_ORDER].dropna()
     if not feature_view.empty:
         latest_index = feature_view.index[-1]
         latest_row = feature_view.loc[[latest_index]]
@@ -157,7 +171,8 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
             "prediction": latest_pred,
             "probability": latest_prob,
             "features": {
-                feature: float(latest_row.iloc[0][feature]) for feature in FEATURE_ORDER
+                feature: float(latest_row.iloc[0][feature])
+                for feature in LOGREG_FEATURE_ORDER
             },
             "anchor_timestamp": int(df.loc[latest_index, "timestamp"]),
         }
@@ -165,6 +180,127 @@ def _recompute_logreg_cache(df: pd.DataFrame | None) -> None:
     with data_lock:
         logreg_samples = samples
         logreg_latest_sample = latest_record
+
+
+def _ensure_rf_model_loaded() -> None:
+    """Lazy-load the random forest model if the artifact exists."""
+
+    global rf_model
+    if rf_model is not None:
+        return
+    if not RF_MODEL_PATH.exists():
+        return
+    try:
+        rf_model = load_rf_model(RF_MODEL_PATH)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.warning("Failed to load random forest model: %s", exc)
+        rf_model = None
+
+
+def _recompute_rf_cache(df: pd.DataFrame | None) -> None:
+    """Update cached random forest samples for the web UI."""
+
+    global rf_samples, rf_latest_sample
+
+    if df is None or df.empty:
+        with data_lock:
+            rf_samples = []
+            rf_latest_sample = None
+        return
+
+    _ensure_rf_model_loaded()
+    if rf_model is None:
+        with data_lock:
+            rf_samples = []
+            rf_latest_sample = None
+        return
+
+    try:
+        features = make_basic_features(df)
+        labels = make_label(df, horizon=5)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.warning("Failed to prepare features for random forest: %s", exc)
+        with data_lock:
+            rf_samples = []
+            rf_latest_sample = None
+        return
+
+    dataset = pd.concat(
+        [
+            features,
+            labels.rename("label"),
+            df[["timestamp", "datetime", "close"]],
+        ],
+        axis=1,
+    )
+    dataset = dataset.dropna(subset=RF_FEATURE_ORDER + ["label"])
+
+    samples: List[Dict[str, object]] = []
+    if not dataset.empty:
+        X = dataset.loc[:, RF_FEATURE_ORDER]
+        y = dataset.loc[:, "label"].astype(int)
+        X_train, X_test, y_train, y_test = time_train_test_split(X, y)
+        if not X_test.empty:
+            preds = predict_rf(rf_model, X_test)
+            try:
+                probs = rf_model.predict_proba(X_test)[:, 1]
+            except Exception:  # pragma: no cover - fallback for unexpected models
+                probs = preds.astype(float)
+            meta = dataset.loc[X_test.index, ["timestamp", "datetime", "close"]].copy()
+            meta["ground_truth"] = y_test
+            meta["prediction"] = preds
+            meta["probability"] = probs
+            for feature in RF_FEATURE_ORDER:
+                meta[feature] = dataset.loc[X_test.index, feature]
+            meta["anchor_timestamp"] = dataset.loc[X_test.index, "timestamp"].astype("int64")
+            samples = [
+                {
+                    "mode": "random",
+                    "timestamp": int(row["timestamp"]),
+                    "datetime": pd.to_datetime(row["datetime"]).isoformat(),
+                    "close": float(row["close"]),
+                    "ground_truth": int(row["ground_truth"]),
+                    "prediction": int(row["prediction"]),
+                    "probability": float(row["probability"]),
+                    "features": {
+                        feature: float(row[feature]) for feature in RF_FEATURE_ORDER
+                    },
+                    "anchor_timestamp": int(row["anchor_timestamp"]),
+                }
+                for _, row in meta.iterrows()
+            ]
+
+    latest_record: Dict[str, object] | None = None
+    feature_view = features.loc[:, RF_FEATURE_ORDER].dropna()
+    if not feature_view.empty:
+        latest_index = feature_view.index[-1]
+        latest_row = feature_view.loc[[latest_index]]
+        latest_pred = int(predict_rf(rf_model, latest_row)[0])
+        try:
+            latest_prob = float(rf_model.predict_proba(latest_row)[:, 1][0])
+        except Exception:  # pragma: no cover - fallback for unexpected models
+            latest_prob = float(latest_pred)
+        label_value = labels.loc[latest_index] if latest_index in labels.index else None
+        ground_truth = None
+        if label_value is not None and not pd.isna(label_value):
+            ground_truth = int(label_value)
+        latest_record = {
+            "mode": "latest",
+            "timestamp": int(df.loc[latest_index, "timestamp"]),
+            "datetime": pd.to_datetime(df.loc[latest_index, "datetime"]).isoformat(),
+            "close": float(df.loc[latest_index, "close"]),
+            "ground_truth": ground_truth,
+            "prediction": latest_pred,
+            "probability": latest_prob,
+            "features": {
+                feature: float(latest_row.iloc[0][feature]) for feature in RF_FEATURE_ORDER
+            },
+            "anchor_timestamp": int(df.loc[latest_index, "timestamp"]),
+        }
+
+    with data_lock:
+        rf_samples = samples
+        rf_latest_sample = latest_record
 
 
 def _ensure_candles_ready(df: pd.DataFrame | None) -> pd.DataFrame:
@@ -208,17 +344,19 @@ def _return_statistics(history: pd.DataFrame) -> Tuple[float, float]:
 
 
 def _forecast_candles(
-    model: Pipeline,
+    model: Any,
     history: pd.DataFrame,
     steps: int,
     interval_ms: int = 60_000,
+    feature_order: Iterable[str] | None = None,
 ) -> List[Dict[str, object]]:
-    """Generate sequential candle forecasts using the logistic regression model."""
+    """Generate sequential candle forecasts using the supplied classification model."""
 
     prepared = _ensure_candles_ready(history)
     if prepared.empty or steps <= 0:
         return []
 
+    order = list(feature_order or LOGREG_FEATURE_ORDER)
     pos_mean, neg_mean = _return_statistics(prepared)
     upper_wick, lower_wick = _wick_statistics(prepared)
     recent_volumes = prepared["volume"].tail(120)
@@ -230,7 +368,7 @@ def _forecast_candles(
     for _ in range(steps):
         features = make_basic_features(working)
         try:
-            feature_view = features.loc[:, FEATURE_ORDER].dropna()
+            feature_view = features.loc[:, order].dropna()
         except KeyError:
             break
         if feature_view.empty:
@@ -424,6 +562,7 @@ def update_dataset() -> bool:
     _save_dataset(combined)
 
     _recompute_logreg_cache(combined.copy())
+    _recompute_rf_cache(combined.copy())
     return True
 
 
@@ -433,6 +572,7 @@ def ensure_dataset_loaded() -> None:
     with data_lock:
         candles_df = df
     _recompute_logreg_cache(df.copy())
+    _recompute_rf_cache(df.copy())
     try:
         update_dataset()
     except requests.RequestException as exc:
@@ -609,7 +749,12 @@ def api_logreg_sample():
     if history_full.empty:
         return jsonify({"error": "Not enough history to generate sample context."}), 503
 
-    forecasts = _forecast_candles(logreg_model, history_full, horizon_minutes)
+    forecasts = _forecast_candles(
+        logreg_model,
+        history_full,
+        horizon_minutes,
+        feature_order=LOGREG_FEATURE_ORDER,
+    )
     if not forecasts:
         return jsonify({"error": "Unable to generate forecast."}), 500
 
@@ -656,7 +801,12 @@ def api_logreg_forecast():
     if logreg_model is None:
         return jsonify({"error": "Logistic regression model is unavailable."}), 503
 
-    forecasts = _forecast_candles(logreg_model, history, steps)
+    forecasts = _forecast_candles(
+        logreg_model,
+        history,
+        steps,
+        feature_order=LOGREG_FEATURE_ORDER,
+    )
     if not forecasts:
         return jsonify({"error": "Unable to generate forecast."}), 500
 
@@ -672,6 +822,135 @@ def api_logreg_forecast():
     }
 
     history_preview = history.tail(LOGREG_CONTEXT_WINDOW)
+
+    return jsonify(
+        {
+            "mode": mode,
+            "steps": len(forecasts),
+            "anchor": anchor_payload,
+            "forecast": _serialise_forecast(forecasts),
+            "ground_truth_candles": ground_truth,
+            "history_candles": _serialise_candles(history_preview.to_dict("records")),
+            "horizon_minutes": len(forecasts),
+        }
+    )
+
+
+@app.route("/api/rf/sample")
+def api_rf_sample():
+    mode = request.args.get("mode", "random").lower()
+    horizon_minutes = _extract_minutes(request.args)
+
+    _ensure_rf_model_loaded()
+
+    with data_lock:
+        model_available = rf_model is not None
+        samples = [sample.copy() for sample in rf_samples]
+        latest = rf_latest_sample.copy() if rf_latest_sample else None
+        df = candles_df.copy() if candles_df is not None else pd.DataFrame()
+
+    if not model_available:
+        return jsonify({"error": "Random forest model is unavailable."}), 503
+
+    prepared = _ensure_candles_ready(df)
+    if prepared.empty:
+        return jsonify({"error": "No candle data available."}), 503
+    ordered = prepared.sort_values("timestamp").reset_index(drop=True)
+
+    if mode == "latest":
+        if latest is None:
+            return jsonify({"error": "Latest sample unavailable."}), 404
+        payload = latest.copy()
+        payload["mode"] = "latest"
+    else:
+        if not samples:
+            return jsonify({"error": "No evaluation samples available."}), 404
+        payload = random.choice(samples)
+        payload["mode"] = "random"
+
+    anchor_ts = int(payload.get("anchor_timestamp", payload.get("timestamp", 0)))
+    matches = ordered.index[ordered["timestamp"] == anchor_ts]
+    if matches.empty:
+        return jsonify({"error": "Anchor candle unavailable in dataset."}), 404
+
+    anchor_pos = int(matches[-1])
+    history_full = ordered.iloc[: anchor_pos + 1].copy()
+    if history_full.empty:
+        return jsonify({"error": "Not enough history to generate sample context."}), 503
+
+    forecasts = _forecast_candles(
+        rf_model,
+        history_full,
+        horizon_minutes,
+        feature_order=RF_FEATURE_ORDER,
+    )
+    if not forecasts:
+        return jsonify({"error": "Unable to generate forecast."}), 500
+
+    history_preview = history_full.tail(RF_CONTEXT_WINDOW)
+    gt_slice = ordered.iloc[anchor_pos + 1 : anchor_pos + 1 + len(forecasts)]
+
+    payload["horizon_minutes"] = len(forecasts)
+    payload["history_candles"] = _serialise_candles(history_preview.to_dict("records"))
+    payload["forecast_candles"] = _serialise_forecast(forecasts)
+    payload["ground_truth_candles"] = _serialise_candles(gt_slice.to_dict("records"))
+
+    return jsonify(payload)
+
+
+@app.route("/api/rf/forecast")
+def api_rf_forecast():
+    mode = request.args.get("mode", "random").lower()
+    steps = _extract_minutes(request.args)
+
+    with data_lock:
+        df = candles_df.copy() if candles_df is not None else pd.DataFrame()
+
+    if df.empty:
+        return jsonify({"error": "No candle data available."}), 503
+
+    prepared = _ensure_candles_ready(df)
+    if prepared.empty:
+        return jsonify({"error": "No candle data available."}), 503
+
+    if mode not in {"latest", "random"}:
+        return jsonify({"error": f"Unsupported forecast mode: {mode}"}), 400
+
+    if mode == "latest":
+        anchor_idx = len(prepared) - 1
+    else:
+        if len(prepared) < steps + 2:
+            return jsonify({"error": "Not enough historical data for random forecast."}), 503
+        anchor_idx = random.randint(0, len(prepared) - steps - 2)
+
+    anchor_row = prepared.iloc[anchor_idx]
+    history = prepared.iloc[: anchor_idx + 1]
+
+    _ensure_rf_model_loaded()
+    if rf_model is None:
+        return jsonify({"error": "Random forest model is unavailable."}), 503
+
+    forecasts = _forecast_candles(
+        rf_model,
+        history,
+        steps,
+        feature_order=RF_FEATURE_ORDER,
+    )
+    if not forecasts:
+        return jsonify({"error": "Unable to generate forecast."}), 500
+
+    ground_truth: List[Dict[str, object]] = []
+    if mode == "random":
+        gt_slice = prepared.iloc[anchor_idx + 1 : anchor_idx + 1 + len(forecasts)]
+        ground_truth = _serialise_candles(gt_slice.to_dict("records"))
+
+    anchor_payload = {
+        "timestamp": int(anchor_row["timestamp"]),
+        "datetime": pd.to_datetime(anchor_row["datetime"]).isoformat(),
+        "close": float(anchor_row["close"]),
+    }
+
+    history_preview = history.tail(RF_CONTEXT_WINDOW)
 
     return jsonify(
         {
@@ -741,6 +1020,21 @@ def index():
           .forecast-controls input { background: #0f172a; border: 1px solid rgba(148,163,184,0.3); border-radius: 0.5rem; padding: 0.45rem 0.6rem; color: #e2e8f0; width: 5.5rem; }
           .forecast-controls input:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 1px rgba(96,165,250,0.4); }
           #forecast-chart { width: 100%; height: 60vh; }
+          .rf-controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+          .rf-card { background: #111827; border-radius: 1rem; padding: 1.5rem; border: 1px solid rgba(148,163,184,0.2); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.35); }
+          .rf-card h2 { margin-top: 0; margin-bottom: 0.5rem; font-size: 1.3rem; }
+          .rf-time { margin: 0; font-size: 0.95rem; color: #cbd5f5; }
+          .rf-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin: 1.25rem 0; }
+          .rf-metrics div { background: #0f172a; border-radius: 0.9rem; padding: 0.9rem 1rem; border: 1px solid rgba(148,163,184,0.2); }
+          .rf-metrics h3 { margin: 0 0 0.4rem 0; font-size: 0.9rem; color: #cbd5f5; }
+          .rf-metrics .value { margin: 0; font-size: 1.4rem; font-weight: 600; }
+          .rf-features h3 { margin: 0 0 0.6rem 0; }
+          .rf-features ul { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem; }
+          .rf-features li { background: #0f172a; border-radius: 0.8rem; padding: 0.6rem 0.8rem; border: 1px solid rgba(148,163,184,0.2); font-size: 0.9rem; }
+          .rf-sample-chart { margin-top: 1.5rem; }
+          .rf-sample-chart h3 { margin: 0 0 0.6rem 0; font-size: 1rem; }
+          #rf-sample-chart { width: 100%; height: 45vh; }
+          .rf-forecast { margin-top: 2rem; }
         </style>
       </head>
       <body>
@@ -752,6 +1046,7 @@ def index():
           <div class="tabs">
             <button class="tab-button active" data-tab="candles">Candlestick chart</button>
             <button class="tab-button" data-tab="logreg">Logistic regression</button>
+            <button class="tab-button" data-tab="rf">Random forest</button>
           </div>
           <section id="candles-tab" class="tab-content active">
             <div class="controls">
@@ -815,6 +1110,57 @@ def index():
               <div id="forecast-chart"></div>
             </div>
           </section>
+          <section id="rf-tab" class="tab-content">
+            <div class="rf-controls">
+              <button id="rf-refresh">Pick random sample</button>
+              <label class="toggle">
+                <input type="checkbox" id="rf-latest-toggle">
+                <span>Use latest candle</span>
+              </label>
+            </div>
+            <div class="status" id="rf-status">Activate the tab to load random forest insights.</div>
+            <div id="rf-card" class="rf-card" hidden>
+              <h2>Random forest signal</h2>
+              <p class="rf-time" id="rf-time"></p>
+              <div class="rf-metrics">
+                <div>
+                  <h3>Ground truth</h3>
+                  <p id="rf-ground-truth" class="value"></p>
+                </div>
+                <div>
+                  <h3>Prediction</h3>
+                  <p id="rf-prediction" class="value"></p>
+                </div>
+                <div>
+                  <h3>Up probability</h3>
+                  <p id="rf-probability" class="value"></p>
+                </div>
+              </div>
+              <div class="rf-features">
+                <h3>Feature values</h3>
+                <ul id="rf-feature-list"></ul>
+              </div>
+              <div class="rf-sample-chart">
+                <h3>Model input and predicted candles</h3>
+                <div id="rf-sample-chart"></div>
+              </div>
+            </div>
+            <div class="rf-forecast">
+              <div class="forecast-controls">
+                <label>
+                  Forecast horizon (minutes)
+                  <input type="number" id="rf-forecast-steps" min="1" max="120" value="15">
+                </label>
+                <button id="rf-forecast-run">Run forecast</button>
+                <label class="toggle">
+                  <input type="checkbox" id="rf-forecast-latest-toggle">
+                  <span>Forecast from latest candle</span>
+                </label>
+              </div>
+              <div class="status" id="rf-forecast-status">Set a horizon and generate a forecast to compare predicted candles with historical ground truth.</div>
+              <div id="rf-forecast-chart"></div>
+            </div>
+          </section>
         </main>
         <script>
           const tabButtons = document.querySelectorAll('.tab-button');
@@ -834,8 +1180,24 @@ def index():
           const forecastStepsInput = document.getElementById('forecast-steps');
           const forecastStatus = document.getElementById('forecast-status');
           const forecastToggle = document.getElementById('forecast-latest-toggle');
+          const rfRefreshButton = document.getElementById('rf-refresh');
+          const rfToggle = document.getElementById('rf-latest-toggle');
+          const rfStatus = document.getElementById('rf-status');
+          const rfCard = document.getElementById('rf-card');
+          const rfTime = document.getElementById('rf-time');
+          const rfGroundTruth = document.getElementById('rf-ground-truth');
+          const rfPrediction = document.getElementById('rf-prediction');
+          const rfProbability = document.getElementById('rf-probability');
+          const rfFeatureList = document.getElementById('rf-feature-list');
+          const rfSampleChart = document.getElementById('rf-sample-chart');
+          const rfForecastRunButton = document.getElementById('rf-forecast-run');
+          const rfForecastStepsInput = document.getElementById('rf-forecast-steps');
+          const rfForecastStatus = document.getElementById('rf-forecast-status');
+          const rfForecastToggle = document.getElementById('rf-forecast-latest-toggle');
+          const rfForecastChart = document.getElementById('rf-forecast-chart');
           let currentInterval = '1m';
           let logregHasLoaded = false;
+          let rfHasLoaded = false;
 
           tabButtons.forEach(btn => {
             btn.addEventListener('click', () => {
@@ -847,6 +1209,11 @@ def index():
                 loadLogregSample();
                 runForecast(true);
                 logregHasLoaded = true;
+              } else if (target === 'rf' && !rfHasLoaded) {
+                updateRfControls();
+                loadRfSample();
+                runRfForecast(true);
+                rfHasLoaded = true;
               }
             });
           });
@@ -900,6 +1267,51 @@ def index():
               if (event.key === 'Enter') {
                 event.preventDefault();
                 runForecast();
+              }
+            });
+          }
+
+          function updateRfControls() {
+            if (!rfRefreshButton) return;
+            const useLatest = rfToggle && rfToggle.checked;
+            rfRefreshButton.disabled = !!useLatest;
+            if (rfRefreshButton.disabled) {
+              rfRefreshButton.title = 'Disable the toggle to draw a random test example.';
+            } else {
+              rfRefreshButton.title = '';
+            }
+          }
+
+          if (rfRefreshButton) {
+            rfRefreshButton.addEventListener('click', () => {
+              loadRfSample();
+            });
+          }
+
+          if (rfToggle) {
+            rfToggle.addEventListener('change', () => {
+              updateRfControls();
+              loadRfSample();
+            });
+          }
+
+          if (rfForecastRunButton) {
+            rfForecastRunButton.addEventListener('click', () => {
+              runRfForecast();
+            });
+          }
+
+          if (rfForecastToggle) {
+            rfForecastToggle.addEventListener('change', () => {
+              runRfForecast();
+            });
+          }
+
+          if (rfForecastStepsInput) {
+            rfForecastStepsInput.addEventListener('keydown', event => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                runRfForecast();
               }
             });
           }
@@ -1201,6 +1613,289 @@ def index():
             };
 
             Plotly.react('logreg-sample-chart', traces, layout, { responsive: true, displaylogo: false });
+          }
+
+          function getRfForecastMinutes() {
+            const rawValue = rfForecastStepsInput ? Number(rfForecastStepsInput.value) : 15;
+            const bounded = Math.max(1, Math.min(Math.round(rawValue) || 15, 120));
+            if (rfForecastStepsInput) {
+              rfForecastStepsInput.value = bounded;
+            }
+            return bounded;
+          }
+
+          async function runRfForecast(auto = false) {
+            if (!rfForecastStatus) return;
+            const bounded = getRfForecastMinutes();
+            const mode = rfForecastToggle && rfForecastToggle.checked ? 'latest' : 'random';
+            rfForecastStatus.textContent = mode === 'latest' ? 'Generating forecast from latest candle…' : 'Generating historical forecast sample…';
+            if (rfForecastRunButton) {
+              rfForecastRunButton.disabled = true;
+            }
+            try {
+              const response = await fetch(`/api/rf/forecast?minutes=${bounded}&mode=${mode}`);
+              const payload = await response.json();
+              if (!response.ok || payload.error) {
+                throw new Error(payload.error || `API error ${response.status}`);
+              }
+              renderRfForecast(payload);
+            } catch (error) {
+              console.error(error);
+              rfForecastStatus.textContent = error.message || 'Forecast unavailable.';
+              if (!auto && window.Plotly) {
+                Plotly.purge('rf-forecast-chart');
+              }
+            } finally {
+              if (rfForecastRunButton) {
+                rfForecastRunButton.disabled = false;
+              }
+            }
+          }
+
+          function renderRfForecast(data) {
+            if (!rfForecastStatus) return;
+            const forecast = Array.isArray(data.forecast) ? data.forecast : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : Array.isArray(data.ground_truth) ? data.ground_truth : [];
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
+            if (!forecast.length) {
+              rfForecastStatus.textContent = 'Forecast unavailable.';
+              if (window.Plotly) {
+                Plotly.purge('rf-forecast-chart');
+              }
+              return;
+            }
+
+            const anchorDate = data.anchor && data.anchor.datetime ? new Date(data.anchor.datetime) : null;
+            const statusParts = [];
+            if (anchorDate && !Number.isNaN(anchorDate.getTime())) {
+              statusParts.push(`Anchor candle: ${anchorDate.toLocaleString()}`);
+            }
+            statusParts.push(data.mode === 'latest' ? 'Mode: latest forecast' : 'Mode: historical evaluation');
+            if (typeof data.horizon_minutes === 'number') {
+              statusParts.push(`Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}`);
+            }
+            if (groundTruth.length === forecast.length && groundTruth.length) {
+              statusParts.push('Ground truth overlay available.');
+            } else if (groundTruth.length) {
+              statusParts.push('Partial ground truth available.');
+            } else {
+              statusParts.push('Ground truth unavailable for this horizon.');
+            }
+            const lastForecast = forecast[forecast.length - 1];
+            if (lastForecast && typeof lastForecast.probability === 'number') {
+              statusParts.push(`Last step up probability: ${(lastForecast.probability * 100).toFixed(1)}%`);
+            }
+            rfForecastStatus.textContent = statusParts.join(' · ');
+
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.5,
+              });
+            }
+
+            const forecastTrace = {
+              x: forecast.map(c => c.datetime),
+              open: forecast.map(c => c.open),
+              high: forecast.map(c => c.high),
+              low: forecast.map(c => c.low),
+              close: forecast.map(c => c.close),
+              type: 'candlestick',
+              name: 'Forecast',
+              increasing: { line: { color: '#38bdf8' } },
+              decreasing: { line: { color: '#f59e0b' } },
+              opacity: 0.65,
+            };
+            traces.push(forecastTrace);
+
+            if (groundTruth.length) {
+              traces.push({
+                x: groundTruth.map(c => c.datetime),
+                open: groundTruth.map(c => c.open),
+                high: groundTruth.map(c => c.high),
+                low: groundTruth.map(c => c.low),
+                close: groundTruth.map(c => c.close),
+                type: 'candlestick',
+                name: 'Ground truth',
+                increasing: { line: { color: '#22c55e' } },
+                decreasing: { line: { color: '#ef4444' } },
+                opacity: 0.85,
+              });
+            }
+
+            const layout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 30, t: 30, b: 50 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+              xaxis: { rangeslider: { visible: false } },
+              yaxis: { fixedrange: false, title: 'Price (USDT)' },
+            };
+
+            if (window.Plotly) {
+              Plotly.react('rf-forecast-chart', traces, layout, { responsive: true, displaylogo: false });
+            }
+          }
+
+          async function loadRfSample() {
+            if (!rfStatus) return;
+            const useLatest = rfToggle && rfToggle.checked;
+            const mode = useLatest ? 'latest' : 'random';
+            rfStatus.textContent = useLatest ? 'Fetching latest candle prediction…' : 'Fetching random test sample…';
+            rfCard.hidden = true;
+            try {
+              const minutes = getRfForecastMinutes();
+              const response = await fetch(`/api/rf/sample?mode=${mode}&minutes=${minutes}`);
+              const payload = await response.json();
+              if (!response.ok || payload.error) {
+                throw new Error(payload.error || `API error ${response.status}`);
+              }
+              renderRfSample(payload);
+            } catch (error) {
+              console.error(error);
+              rfStatus.textContent = error.message || 'Random forest data unavailable.';
+              if (window.Plotly) {
+                Plotly.purge('rf-sample-chart');
+              }
+            }
+          }
+
+          function renderRfSample(data) {
+            const mode = data.mode || (rfToggle && rfToggle.checked ? 'latest' : 'random');
+            if (mode === 'random') {
+              if (data.ground_truth === null || data.ground_truth === undefined) {
+                rfStatus.textContent = 'Random test sample. Ground truth unavailable.';
+              } else if (Number(data.ground_truth) === Number(data.prediction)) {
+                rfStatus.textContent = 'Random test sample · Prediction matched the ground truth.';
+              } else {
+                rfStatus.textContent = 'Random test sample · Prediction differed from the ground truth.';
+              }
+            } else {
+              rfStatus.textContent = 'Latest candle prediction (ground truth may not yet exist).';
+            }
+
+            if (typeof data.horizon_minutes === 'number') {
+              rfStatus.textContent += ` Horizon: ${data.horizon_minutes} minute${data.horizon_minutes === 1 ? '' : 's'}.`;
+            }
+
+            const ts = data.datetime;
+            const date = new Date(ts);
+            const humanTime = Number.isNaN(date.getTime()) ? ts : date.toLocaleString();
+            const closePrice = typeof data.close === 'number' ? data.close : Number(data.close);
+            const priceText = Number.isFinite(closePrice) ? closePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : 'N/A';
+            rfTime.textContent = `Candle time: ${humanTime} · Close: ${priceText} USDT`;
+
+            applyOutcome(rfGroundTruth, data.ground_truth);
+            applyOutcome(rfPrediction, data.prediction);
+
+            if (typeof data.probability === 'number' && Number.isFinite(data.probability)) {
+              const percentage = (data.probability * 100).toFixed(1);
+              rfProbability.textContent = `${percentage}% up`;
+            } else {
+              rfProbability.textContent = 'N/A';
+            }
+
+            rfFeatureList.innerHTML = '';
+            const features = data.features || {};
+            Object.entries(features).forEach(([name, value]) => {
+              const li = document.createElement('li');
+              let display = Number(value);
+              if (!Number.isFinite(display)) {
+                li.textContent = `${name}: ${value}`;
+              } else {
+                li.textContent = `${name}: ${display.toFixed(4)}`;
+              }
+              rfFeatureList.appendChild(li);
+            });
+
+            renderRfSampleChart(data);
+            rfCard.hidden = false;
+          }
+
+          function renderRfSampleChart(data) {
+            if (!rfSampleChart || !window.Plotly) {
+              return;
+            }
+            const history = Array.isArray(data.history_candles) ? data.history_candles : [];
+            const forecast = Array.isArray(data.forecast_candles) ? data.forecast_candles : [];
+            const groundTruth = Array.isArray(data.ground_truth_candles) ? data.ground_truth_candles : [];
+
+            if (!history.length && !forecast.length) {
+              Plotly.purge('rf-sample-chart');
+              return;
+            }
+
+            const traces = [];
+
+            if (history.length) {
+              traces.push({
+                x: history.map(c => c.datetime),
+                open: history.map(c => c.open),
+                high: history.map(c => c.high),
+                low: history.map(c => c.low),
+                close: history.map(c => c.close),
+                type: 'candlestick',
+                name: 'History',
+                increasing: { line: { color: '#94a3b8' } },
+                decreasing: { line: { color: '#64748b' } },
+                opacity: 0.55,
+              });
+            }
+
+            if (forecast.length) {
+              traces.push({
+                x: forecast.map(c => c.datetime),
+                open: forecast.map(c => c.open),
+                high: forecast.map(c => c.high),
+                low: forecast.map(c => c.low),
+                close: forecast.map(c => c.close),
+                type: 'candlestick',
+                name: 'Forecast',
+                increasing: { line: { color: '#38bdf8' } },
+                decreasing: { line: { color: '#f97316' } },
+                opacity: 0.75,
+              });
+            }
+
+            if (groundTruth.length) {
+              traces.push({
+                x: groundTruth.map(c => c.datetime),
+                open: groundTruth.map(c => c.open),
+                high: groundTruth.map(c => c.high),
+                low: groundTruth.map(c => c.low),
+                close: groundTruth.map(c => c.close),
+                type: 'candlestick',
+                name: 'Ground truth',
+                increasing: { line: { color: '#22c55e' } },
+                decreasing: { line: { color: '#ef4444' } },
+                opacity: 0.85,
+              });
+            }
+
+            const layout = {
+              paper_bgcolor: '#0f172a',
+              plot_bgcolor: '#0f172a',
+              font: { color: '#e2e8f0' },
+              margin: { l: 60, r: 30, t: 30, b: 40 },
+              showlegend: true,
+              legend: { orientation: 'h' },
+              xaxis: { rangeslider: { visible: false } },
+              yaxis: { fixedrange: false, title: 'Price (USDT)' },
+            };
+
+            Plotly.react('rf-sample-chart', traces, layout, { responsive: true, displaylogo: false });
           }
 
           async function fetchAndRender() {
