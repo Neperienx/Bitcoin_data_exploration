@@ -140,10 +140,23 @@ def generate_trade_report(
     *,
     ground_truth: Optional[Iterable[MutableMapping[str, Number]]] = None,
     initial_cash: float = 100.0,
+    simulation_steps: Optional[int] = None,
 ) -> dict:
     """Generate trade recommendations and evaluate them against ground truth."""
 
     forecast_rows = [_normalise_candle(c) for c in forecast or []]
+    total_steps = len(forecast_rows)
+    steps = total_steps
+    if simulation_steps is not None and total_steps:
+        try:
+            requested = int(simulation_steps)
+        except (TypeError, ValueError):
+            requested = total_steps
+        if requested > 0:
+            steps = max(1, min(requested, total_steps))
+        else:
+            steps = total_steps
+    simulation_rows = forecast_rows[:steps]
     truth_rows = [
         {
             **_normalise_timestamp(c),
@@ -152,12 +165,14 @@ def generate_trade_report(
         }
         for c in (ground_truth or [])
     ]
+    if simulation_rows:
+        truth_rows = truth_rows[: len(simulation_rows)]
 
     state = TradeBotState(cash=float(initial_cash))
     decisions: List[dict] = []
     orders: List[dict] = []
 
-    for idx, candle in enumerate(forecast_rows):
+    for idx, candle in enumerate(simulation_rows):
         price = candle["open"] or candle["close"]
         if price <= 0:
             price = candle["close"] or 0.0
@@ -226,7 +241,7 @@ def generate_trade_report(
             }
         )
 
-    last_price = forecast_rows[-1]["close"] if forecast_rows else 0.0
+    last_price = simulation_rows[-1]["close"] if simulation_rows else 0.0
     final_equity = state.cash + state.position * last_price
     final_state = {
         "cash": state.cash,
@@ -245,6 +260,7 @@ def generate_trade_report(
         "final_state": final_state,
         "evaluation": evaluation,
         "summary": _summarise_orders(orders),
+        "simulation_steps": len(simulation_rows),
     }
 
 
@@ -258,9 +274,15 @@ def serialise_trade_report(report: Optional[dict]) -> Optional[dict]:
         except (TypeError, ValueError):
             return 0.0
 
+    try:
+        sim_steps = int(serialise_number(report.get("simulation_steps")))
+    except (TypeError, ValueError):
+        sim_steps = 0
+
     serialised = {
         "initial_cash": serialise_number(report.get("initial_cash")),
         "summary": report.get("summary"),
+        "simulation_steps": sim_steps,
         "final_state": {
             "cash": serialise_number(report.get("final_state", {}).get("cash")),
             "position": serialise_number(report.get("final_state", {}).get("position")),
